@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=78,<81", "wheel>=0.45,<1"]
+requires = ["setuptools>=78,<84", "wheel>=0.45,<1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,7 +14,7 @@ authors = [{name = "Tiago Silva"}]
 dependencies = [
   "gymnasium>=1.2,<2",
   "numpy>=1.26,<3",
-  "torch>=2.12,<2.13",
+  "torch>=2.12,<2.14",
   "wandb>=0.18,<0.23",
 ]
 

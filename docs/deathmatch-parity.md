@@ -74,6 +74,91 @@ The retained aggregate evidence is under `/home/tsilva/gradoom-runs` in
 `20260813-source-layer16-sprite1-depth-eval100-n100-seed10000`, and
 `20260813-reference-frozenenc-sidedsign-seed789-20m`.
 
+## 2026-08-14 bug-first parity milestone
+
+Two production parity defects were isolated and corrected without changing
+damage scales, rewards, episode rules, or policy inputs:
+
+- The fast native renderer omitted every dynamic combat effect. It now renders
+  mutually exclusive player and enemy projectiles, impacts and explosions,
+  teleport fog, and hitscan puffs with their reference additive or translucent
+  composition styles. In an exact-weapon policy-observation comparison, mean
+  absolute error fell from 4.134 to 2.678/255, action-distribution KL divergence
+  fell from 0.225 to 0.163, and action argmax agreement rose from 66.1% to
+  71.1%. A raw plasma-fire comparison with the weapon hidden reaches
+  0.382/255 mean absolute error and 0.9885 correlation over 16 frames.
+- Monster hitscan autoaim used the raw target midpoint instead of the target
+  vertical interval clipped through portal openings. The corrected CUDA path
+  returns the clipped aim interval and preserves ViZDoom attack/chase target
+  state timing. Across 1,024 aligned Zombieman/ChaingunGuy infighting trials,
+  GraDOOM versus ViZDoom records 4.650 versus 4.558 mean damage, 1.082 versus
+  1.104 mean hits, 61.82% versus 62.01% kill observation, and 32.06 versus
+  32.21 mean first-kill decision. Post-kill damage, previously exactly zero in
+  GraDOOM, is now 6.250 versus 5.872.
+
+The untouched converted reference policy now scores 25.23 mean kills over 100
+fixed-seed GraDOOM episodes, up from 23.36 immediately before these fixes. The
+same policy scores 35.11 in ViZDoom, so GraDOOM retains 71.9% of the source
+mean. This confirms that the fixes improve real policy transfer, but it remains
+below both the 30-kill training target and the 90% release gate and is not
+certification. The combined corrections sustain 22,639 median environment
+transitions per second at 2,048 environments on the reference RTX 4090
+benchmark, within 1.7% of the effects-disabled implementation.
+
+Reproducible evidence is retained in:
+
+- `/home/tsilva/gradoom-runs/20260814-effect-ablation-u300-n32-seed10000.json`
+- `/home/tsilva/gradoom-runs/20260814-optimized-correct-effect-styles-exact-weapon-u300-n32-seed10000.json`
+- `/home/tsilva/gradoom-runs/20260814-raw-plasma-fire-hide-weapon-seed1337/`
+- `/home/tsilva/gradoom-runs/20260814-infighting-zombie-chaingun1024-portal-autoaim-target-state-fix-seed10000.json`
+- `/home/tsilva/gradoom-runs/20260814-summoned-zombieman1024-noop-d44-autoaim-state-fix-seed10000.json`
+- `/home/tsilva/gradoom-runs/20260814-render-effects-autoaim-state-reference-eval100-seed10000.jsonl`
+
+## 2026-08-14 missile-spawn and no-autofire follow-up
+
+Synchronized raw-RGB/state traces exposed two additional deterministic
+mechanics defects. GraDOOM now performs Doom's `P_CheckMissileSpawn` collision
+test at the already-advanced half-step spawn position, including the missile
+radius when deriving a two-sided portal's floor and ceiling opening. It also
+implements the Rocket Launcher's `WEAPON.NOAUTOFIRE` flag: attack starts held,
+so a trigger held before the weapon first reaches Ready must be released before
+the first shot, while `A_ReFire` may continue an established firing sequence.
+Neither correction changes rewards, damage, observations, episode rules, or
+the policy action space.
+
+In the seed-789 plasma oracle, ViZDoom's first impact is at
+`(581.610916, 513.577087, -32)` and GraDOOM's corrected CUDA impact is within
+1.5e-5 map units; the first impact scene is pixel exact. In the Rocket Launcher
+oracle, both providers retain 100 rockets and zero player damage while attack
+is held before Ready. Screen-flash on/off/default ablations are pixel identical
+for the causal plasma trajectory and rule out flash composition as the source
+of the old divergence.
+
+The full Doom-II-backed suite passes 327 tests, with only three optional
+Freedoom tests skipped. On the reference RTX 4090 workload, the corrected
+native-fused fast path reaches **22,961 median environment transitions/s** at
+2,048 environments, versus 22,639 before the corrections. The result therefore
+shows no fast-path regression.
+
+Fixed seed-10000 stochastic evaluation does not establish a policy-quality
+gain. The untouched converted ViZDoom policy scores **23.20 mean kills** over
+100 GraDOOM episodes (median 18, standard deviation 17.21), versus its prior
+25.23 GraDOOM measurement and existing 35.11 ViZDoom result. The 4.03M-sample
+GraDOOM-adapted checkpoint scores **26.75 mean kills** (median 23, standard
+deviation 17.51), versus 27.39 before the corrections and 39.38 in ViZDoom.
+The changes are retained because the raw causal behavior is reference-correct
+and the fixed-grid shifts are small relative to episode variance, but the
+greater-than-or-equal-to-30 and similar-transfer gates remain unmet.
+
+Reproducible evidence is retained in:
+
+- `/home/tsilva/gradoom-runs/20260814-plasma-seed789-spawn-opening-cuda.json`
+- `/home/tsilva/gradoom-runs/20260814-rocket-seed789-noautofire-parity.json`
+- `/home/tsilva/gradoom-runs/20260814-projectile-spawn-opening-cuda-4seeds.json`
+- `/home/tsilva/gradoom-runs/20260814-projectile-spawn-noautofire-throughput-2048.json`
+- `/home/tsilva/gradoom-runs/20260814-projectile-spawn-noautofire-source-eval100-seed10000.jsonl`
+- `/home/tsilva/gradoom-runs/20260814-projectile-spawn-noautofire-adapted-eval100-seed10000.jsonl`
+
 ## Release gates
 
 1. Differential micro-scenarios pass for all deterministic mechanics.

@@ -283,24 +283,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
         ):
             raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
-        checkpoint_config = loaded.get("config", {})
-        effective_recipe = (
-            checkpoint_config.get("effective_recipe", {})
-            if isinstance(checkpoint_config, Mapping)
-            else {}
-        )
-        observation_invariance = (
-            checkpoint_config.get("observation_invariance", {})
-            if isinstance(checkpoint_config, Mapping)
-            else {}
-        )
-        observation_blur_kernel = int(
-            effective_recipe.get(
-                "observation_blur_kernel",
-                observation_invariance.get("observation_blur_kernel", 1),
-            )
-        )
-        policy = train.NatureActorCritic(observation_blur_kernel=observation_blur_kernel).to(device)
+        policy = train.NatureActorCritic(**train._checkpoint_policy_kwargs(loaded)).to(device)
         policy.load_state_dict(loaded["policy_state_dict"])
         policy.eval()
         calls = train.PolicyCalls(policy, compile_policy=bool(args.compile_policy))

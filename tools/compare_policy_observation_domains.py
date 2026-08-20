@@ -286,6 +286,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         architecture,
         memory_format,
         blur_kernel,
+        train._checkpoint_fusion_activation(loaded),
     ).to(device)
     policy.load_state_dict(loaded["policy_state_dict"])
     policy.eval()

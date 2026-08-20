@@ -174,15 +174,22 @@ REFERENCE_RECIPE = Recipe()
 
 @dataclass(frozen=True)
 class PolicyArchitecture:
-    """Static NatureCNN widths used by an audited training run."""
+    """Static visual-encoder widths used by an audited training run."""
 
     convolution_channels: tuple[int, int, int]
     observation_features: int
     fusion_features: int
+    observation_encoder: str = "nature_cnn"
 
 
 POLICY_ARCHITECTURES = {
     "nature": PolicyArchitecture((32, 64, 64), 512, 256),
+    "resnet-small": PolicyArchitecture(
+        (32, 64, 64),
+        512,
+        256,
+        observation_encoder="residual_nature_cnn",
+    ),
     # Preserve the successful policy/value trunk while reducing only the
     # convolutional work.  The earlier half/quarter profiles also narrowed the
     # learned observation embedding and fusion trunk, so they could not
@@ -194,6 +201,7 @@ POLICY_ARCHITECTURES = {
     "nature-half": PolicyArchitecture((16, 32, 32), 128, 128),
     "nature-quarter": PolicyArchitecture((8, 16, 16), 128, 128),
 }
+FUSION_ACTIVATIONS = ("tanh", "relu")
 
 # Keep the immutable GradLab recipe above as evidence, while using the measured
 # RTX 4090 sweet spot for new standalone runs.  Both shapes contain 4,096
@@ -348,8 +356,8 @@ def _parser() -> argparse.ArgumentParser:
         choices=tuple(POLICY_ARCHITECTURES),
         default="nature",
         help=(
-            "Audited NatureCNN width profile. 'nature' preserves checkpoint compatibility; "
-            "the half- and quarter-width profiles trade capacity for training throughput."
+            "Audited visual-encoder profile. 'nature' preserves checkpoint compatibility; "
+            "'resnet-small' adds identity-initialized residual adapters to that encoder."
         ),
     )
     parser.add_argument(
@@ -359,6 +367,15 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "CUDA convolution memory format (default: channels-last, including the "
             "policy-input conversion in the compiled graph)."
+        ),
+    )
+    parser.add_argument(
+        "--fusion-activation",
+        choices=FUSION_ACTIVATIONS,
+        default="tanh",
+        help=(
+            "Activation after fusing visual and combat-context features "
+            "(default: tanh, preserving existing checkpoint behavior)."
         ),
     )
     parser.add_argument(
@@ -618,6 +635,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "observation blur is incompatible with the frozen-encoder custom convolution"
         )
+    if (
+        str(args.policy_architecture) == "resnet-small"
+        and bool(args.freeze_observation_encoder)
+        and bool(args.frozen_encoder_custom_conv)
+    ):
+        raise ValueError(
+            "resnet-small is incompatible with the frozen-encoder custom convolution"
+        )
     rollout_transitions = int(args.num_envs) * int(args.n_steps)
     if int(args.batch_size) > rollout_transitions:
         raise ValueError("batch-size cannot exceed num-envs * n-steps")
@@ -695,6 +720,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
         "float32_matmul_precision": str(args.float32_matmul_precision),
         "policy_architecture": str(args.policy_architecture),
         "policy_memory_format": str(args.policy_memory_format),
+        "fusion_activation": str(args.fusion_activation),
         "observation_blur_kernel": int(args.observation_blur_kernel),
         "observation_augmentation": str(args.observation_augmentation),
         "freeze_observation_encoder": bool(args.freeze_observation_encoder),
@@ -785,7 +811,9 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
         "policy_model": {
             "architecture": str(args.policy_architecture),
             "memory_format": str(args.policy_memory_format),
-            "observation_encoder": "nature_cnn",
+            "observation_encoder": POLICY_ARCHITECTURES[
+                str(args.policy_architecture)
+            ].observation_encoder,
             "convolution_channels": list(
                 POLICY_ARCHITECTURES[str(args.policy_architecture)].convolution_channels
             ),
@@ -795,7 +823,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "context_history_frames": MODEL_CONTEXT_FRAMES,
             "context_features": CONTEXT_FEATURES,
             "fusion_features": POLICY_ARCHITECTURES[str(args.policy_architecture)].fusion_features,
-            "fusion_activation": "tanh",
+            "fusion_activation": str(args.fusion_activation),
             "shared_actor_critic_features": True,
             "normalize_images": True,
             "observation_blur_kernel": int(args.observation_blur_kernel),
@@ -805,6 +833,11 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "observation_encoder_train_mode": (
                 "frozen"
                 if bool(args.freeze_observation_encoder)
+                else "projection-plus-residuals"
+                if (
+                    bool(args.train_observation_projection_only)
+                    and str(args.policy_architecture) == "resnet-small"
+                )
                 else "projection-only"
                 if bool(args.train_observation_projection_only)
                 else "all"
@@ -1305,14 +1338,73 @@ class PlayerCombatReward:
         return reward
 
 
+class ResidualBlock(nn.Module):
+    """Two-convolution residual adapter that can start as an exact identity."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        residual = self.conv2(F.relu(self.conv1(inputs)))
+        return F.relu(inputs + residual)
+
+    def initialize_identity(self) -> None:
+        nn.init.zeros_(self.conv2.weight)
+        if self.conv2.bias is not None:
+            nn.init.zeros_(self.conv2.bias)
+
+
+class ResidualNatureEncoder(nn.Sequential):
+    """NatureCNN with an identity-initialized residual adapter after each stage."""
+
+    def __init__(self, observation_features: int = 512) -> None:
+        super().__init__(
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, observation_features),
+            nn.ReLU(),
+        )
+        # Numeric modules deliberately preserve NatureCNN state-dict keys. This
+        # lets a trained Nature policy seed the ResNet without changing its
+        # initial function; only these additional adapters are missing.
+        self.add_module("residual_32", ResidualBlock(32))
+        self.add_module("residual_64_middle", ResidualBlock(64))
+        self.add_module("residual_64_output", ResidualBlock(64))
+
+    def residual_blocks(self) -> tuple[ResidualBlock, ...]:
+        return (
+            self.residual_32,
+            self.residual_64_middle,
+            self.residual_64_output,
+        )
+
+    def initialize_residual_identities(self) -> None:
+        for block in self.residual_blocks():
+            block.initialize_identity()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        encoded = self.residual_32(self[1](self[0](inputs)))
+        encoded = self.residual_64_middle(self[3](self[2](encoded)))
+        encoded = self.residual_64_output(self[5](self[4](encoded)))
+        return self[8](self[7](self[6](encoded)))
+
+
 class NatureActorCritic(nn.Module):
-    """Shared NatureCNN actor-critic with a fixed, audited width profile."""
+    """Shared visual actor-critic with a fixed, audited encoder profile."""
 
     def __init__(
         self,
         architecture: str = "nature",
         memory_format: str = "contiguous",
         observation_blur_kernel: int = 1,
+        fusion_activation: str = "tanh",
     ) -> None:
         super().__init__()
         if memory_format not in ("contiguous", "channels-last"):
@@ -1320,26 +1412,32 @@ class NatureActorCritic(nn.Module):
         self.channels_last = memory_format == "channels-last"
         self.observation_blur_kernel = int(observation_blur_kernel)
         self.use_frozen_encoder_custom_conv = False
+        if fusion_activation not in FUSION_ACTIVATIONS:
+            raise ValueError(f"unsupported fusion activation: {fusion_activation}")
         profile = POLICY_ARCHITECTURES[architecture]
+        self.architecture = architecture
         self.observation_feature_count = profile.observation_features
         first_channels, second_channels, third_channels = profile.convolution_channels
-        self.observation_encoder = nn.Sequential(
-            nn.Conv2d(4, first_channels, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(first_channels, second_channels, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(second_channels, third_channels, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(third_channels * 7 * 7, profile.observation_features),
-            nn.ReLU(),
-        )
+        if profile.observation_encoder == "residual_nature_cnn":
+            self.observation_encoder = ResidualNatureEncoder(profile.observation_features)
+        else:
+            self.observation_encoder = nn.Sequential(
+                nn.Conv2d(4, first_channels, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(first_channels, second_channels, kernel_size=4, stride=2),
+                nn.ReLU(),
+                nn.Conv2d(second_channels, third_channels, kernel_size=3, stride=1),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(third_channels * 7 * 7, profile.observation_features),
+                nn.ReLU(),
+            )
         self.fusion = nn.Sequential(
             nn.Linear(
                 profile.observation_features + CONTEXT_FEATURES,
                 profile.fusion_features,
             ),
-            nn.Tanh(),
+            nn.Tanh() if fusion_activation == "tanh" else nn.ReLU(),
         )
         self.action_head = nn.Linear(
             profile.fusion_features,
@@ -1347,6 +1445,8 @@ class NatureActorCritic(nn.Module):
         )
         self.value_head = nn.Linear(profile.fusion_features, 1)
         self._orthogonal_initialize()
+        if isinstance(self.observation_encoder, ResidualNatureEncoder):
+            self.observation_encoder.initialize_residual_identities()
 
     @staticmethod
     def _initialize_module(module: nn.Module, gain: float) -> None:
@@ -1461,6 +1561,80 @@ class NatureActorCritic(nn.Module):
     ) -> torch.Tensor:
         features = self.features(observations, context)
         return torch.argmax(self.action_head(features), dim=1)
+
+
+def _checkpoint_fusion_activation(loaded: Mapping[str, Any]) -> str:
+    """Read the saved fusion activation, treating pre-field checkpoints as Tanh."""
+    config = loaded.get("config", {})
+    policy_model = config.get("policy_model", {}) if isinstance(config, Mapping) else {}
+    activation = str(policy_model.get("fusion_activation", "tanh"))
+    if activation not in FUSION_ACTIVATIONS:
+        raise ValueError(f"unsupported checkpoint fusion activation: {activation}")
+    return activation
+
+
+def _checkpoint_policy_kwargs(loaded: Mapping[str, Any]) -> dict[str, str | int]:
+    """Recover architecture-affecting policy settings with legacy defaults."""
+    config = loaded.get("config", {})
+    policy_model = config.get("policy_model", {}) if isinstance(config, Mapping) else {}
+    effective = config.get("effective_recipe", {}) if isinstance(config, Mapping) else {}
+    observation_invariance = (
+        config.get("observation_invariance", {}) if isinstance(config, Mapping) else {}
+    )
+    architecture = str(policy_model.get("architecture", "nature"))
+    memory_format = str(policy_model.get("memory_format", "contiguous"))
+    blur_kernel = int(
+        effective.get(
+            "observation_blur_kernel",
+            policy_model.get(
+                "observation_blur_kernel",
+                observation_invariance.get("observation_blur_kernel", 1),
+            ),
+        )
+    )
+    if architecture not in POLICY_ARCHITECTURES:
+        raise ValueError(f"unsupported checkpoint policy architecture: {architecture}")
+    if memory_format not in ("contiguous", "channels-last"):
+        raise ValueError(f"unsupported checkpoint policy memory format: {memory_format}")
+    if blur_kernel <= 0 or blur_kernel % 2 == 0:
+        raise ValueError(f"unsupported checkpoint observation blur kernel: {blur_kernel}")
+    return {
+        "architecture": architecture,
+        "memory_format": memory_format,
+        "observation_blur_kernel": blur_kernel,
+        "fusion_activation": _checkpoint_fusion_activation(loaded),
+    }
+
+
+def _load_policy_initialization(
+    policy: NatureActorCritic,
+    loaded: Mapping[str, Any],
+) -> str:
+    """Load exact weights, allowing only the audited Nature-to-ResNet migration."""
+    source_architecture = str(_checkpoint_policy_kwargs(loaded)["architecture"])
+    state_dict = loaded.get("policy_state_dict")
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("initialization checkpoint has no policy state dictionary")
+    if source_architecture == policy.architecture:
+        policy.load_state_dict(state_dict)
+        return "policy-weights-only"
+    if source_architecture != "nature" or policy.architecture != "resnet-small":
+        raise ValueError(
+            "unsupported policy architecture migration: "
+            f"{source_architecture} -> {policy.architecture}"
+        )
+    incompatible = policy.load_state_dict(state_dict, strict=False)
+    expected_missing = {
+        name
+        for name in policy.state_dict()
+        if name.startswith("observation_encoder.residual_")
+    }
+    if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+        raise ValueError(
+            "Nature-to-ResNet initialization had incompatible state keys: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
+    return "policy-weights-plus-identity-residuals"
 
 
 class PolicyCalls:
@@ -2007,6 +2181,9 @@ def _configure_observation_encoder_trainability(
     if len(projections) != 1:  # pragma: no cover - architecture invariant
         raise RuntimeError(f"expected one observation projection, found {len(projections)}")
     projections[0].requires_grad_(True)
+    if isinstance(policy.observation_encoder, ResidualNatureEncoder):
+        for block in policy.observation_encoder.residual_blocks():
+            block.requires_grad_(True)
 
 
 def _load_optimizer_state(
@@ -2308,6 +2485,7 @@ def _evaluate(
             str(args.policy_architecture),
             str(args.policy_memory_format),
             int(args.observation_blur_kernel),
+            _checkpoint_fusion_activation(loaded),
         ).to(
             device=device,
             memory_format=(
@@ -2639,6 +2817,7 @@ def _train(
             str(args.policy_architecture),
             str(args.policy_memory_format),
             int(args.observation_blur_kernel),
+            str(args.fusion_activation),
         ).to(
             device=device,
             memory_format=(
@@ -2668,7 +2847,7 @@ def _train(
                 or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
             ):
                 raise ValueError(f"unsupported initialization checkpoint: {args.initialize_from}")
-            policy.load_state_dict(loaded["policy_state_dict"])
+            initialization_mode = _load_policy_initialization(policy, loaded)
             emitter.emit(
                 {
                     "type": "event",
@@ -2676,7 +2855,7 @@ def _train(
                     "checkpoint": str(args.initialize_from),
                     "checkpoint_sha256": _file_sha256(args.initialize_from),
                     "source_step": int(loaded.get("step", 0)),
-                    "mode": "policy-weights-only",
+                    "mode": initialization_mode,
                 }
             )
         if args.resume is not None:
@@ -3106,6 +3285,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     process_started = time.perf_counter()
     args = _parser().parse_args(argv)
     _validate_args(args)
+    if args.evaluate_checkpoint is not None:
+        checkpoint_metadata = torch.load(
+            args.evaluate_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if (
+            not isinstance(checkpoint_metadata, Mapping)
+            or checkpoint_metadata.get("format")
+            != "standalone-env_doom_turbo_torch-ppo-v1"
+        ):
+            raise ValueError(f"unsupported evaluation checkpoint: {args.evaluate_checkpoint}")
+        checkpoint_policy = _checkpoint_policy_kwargs(checkpoint_metadata)
+        args.policy_architecture = checkpoint_policy["architecture"]
+        args.policy_memory_format = checkpoint_policy["memory_format"]
+        args.observation_blur_kernel = checkpoint_policy["observation_blur_kernel"]
+        args.fusion_activation = checkpoint_policy["fusion_activation"]
+        _validate_args(args)
     torch.set_float32_matmul_precision(str(args.float32_matmul_precision))
     audit = _audit_config(args)
     emitter = JsonEmitter(args.metrics_jsonl)

@@ -114,7 +114,7 @@ def main() -> int:
         env.close()
         raise RuntimeError("ffmpeg did not expose its input pipe")
 
-    policy = train.NatureActorCritic().to(device)
+    policy = train.NatureActorCritic(**train._checkpoint_policy_kwargs(loaded)).to(device)
     policy.load_state_dict(loaded["policy_state_dict"])
     policy.eval()
     context_encoder = train.CombatContextEncoder(env.device_info_history_names, device)

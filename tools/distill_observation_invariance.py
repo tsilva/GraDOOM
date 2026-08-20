@@ -257,9 +257,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         architecture,
         memory_format,
         source_blur_kernel,
+        train._checkpoint_fusion_activation(loaded),
     ).to(device)
     student = train.NatureActorCritic(
-        architecture, memory_format, observation_blur_kernel=args.observation_blur_kernel
+        architecture,
+        memory_format,
+        observation_blur_kernel=args.observation_blur_kernel,
+        fusion_activation=train._checkpoint_fusion_activation(loaded),
     ).to(device)
     teacher.load_state_dict(loaded["policy_state_dict"])
     student.load_state_dict(loaded["policy_state_dict"])

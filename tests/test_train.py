@@ -232,6 +232,107 @@ def test_channels_last_policy_format_is_explicitly_audited() -> None:
     assert config["policy_model"]["memory_format"] == "channels-last"
 
 
+def test_fusion_activation_is_selectable_audited_and_checkpoint_compatible() -> None:
+    tanh_args = _args("--config-only")
+    relu_args = _args("--config-only", "--fusion-activation", "relu")
+
+    tanh_policy = train.NatureActorCritic(fusion_activation=tanh_args.fusion_activation)
+    relu_policy = train.NatureActorCritic(fusion_activation=relu_args.fusion_activation)
+
+    assert isinstance(tanh_policy.fusion[1], torch.nn.Tanh)
+    assert isinstance(relu_policy.fusion[1], torch.nn.ReLU)
+    assert train._audit_config(tanh_args)["policy_model"]["fusion_activation"] == "tanh"
+    assert train._audit_config(relu_args)["effective_recipe"]["fusion_activation"] == "relu"
+    assert train._checkpoint_fusion_activation({"config": {}}) == "tanh"
+    assert (
+        train._checkpoint_fusion_activation(
+            {"config": {"policy_model": {"fusion_activation": "relu"}}}
+        )
+        == "relu"
+    )
+
+
+def test_small_resnet_is_an_identity_initialized_checkpoint_compatible_adapter() -> None:
+    torch.manual_seed(7)
+    nature = train.NatureActorCritic("nature")
+    resnet = train.NatureActorCritic("resnet-small")
+    loaded = {
+        "config": {"policy_model": {"architecture": "nature"}},
+        "policy_state_dict": nature.state_dict(),
+    }
+
+    mode = train._load_policy_initialization(resnet, loaded)
+    observations = torch.randint(0, 256, (3, 4, 84, 84), dtype=torch.uint8)
+    context = torch.randn(3, train.CONTEXT_FEATURES)
+
+    assert mode == "policy-weights-plus-identity-residuals"
+    assert isinstance(resnet.observation_encoder, train.ResidualNatureEncoder)
+    assert sum(parameter.numel() for parameter in resnet.parameters()) > sum(
+        parameter.numel() for parameter in nature.parameters()
+    )
+    torch.testing.assert_close(
+        resnet.encode_observations(observations),
+        nature.encode_observations(observations),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        resnet.action_head(resnet.features(observations, context)),
+        nature.action_head(nature.features(observations, context)),
+        rtol=0.0,
+        atol=0.0,
+    )
+    config = train._audit_config(_args("--policy-architecture", "resnet-small"))
+    assert config["policy_model"]["observation_encoder"] == "residual_nature_cnn"
+
+
+def test_small_resnet_projection_mode_trains_projection_and_residual_adapters() -> None:
+    args = _args(
+        "--policy-architecture",
+        "resnet-small",
+        "--train-observation-projection-only",
+    )
+    policy = train.NatureActorCritic("resnet-small")
+
+    train._configure_observation_encoder_trainability(
+        policy,
+        freeze=False,
+        projection_only=True,
+    )
+    trainable = {
+        name
+        for name, parameter in policy.observation_encoder.named_parameters()
+        if parameter.requires_grad
+    }
+
+    assert {"7.weight", "7.bias"}.issubset(trainable)
+    assert any(name.startswith("residual_32.") for name in trainable)
+    assert not any(name.startswith("0.") for name in trainable)
+    assert train._audit_config(args)["policy_model"]["observation_encoder_train_mode"] == (
+        "projection-plus-residuals"
+    )
+
+
+def test_checkpoint_policy_kwargs_restore_resnet_settings() -> None:
+    loaded = {
+        "config": {
+            "policy_model": {
+                "architecture": "resnet-small",
+                "memory_format": "channels-last",
+                "fusion_activation": "relu",
+                "observation_blur_kernel": 3,
+            }
+        }
+    }
+
+    assert train._checkpoint_policy_kwargs(loaded) == {
+        "architecture": "resnet-small",
+        "memory_format": "channels-last",
+        "observation_blur_kernel": 3,
+        "fusion_activation": "relu",
+    }
+
+
 def test_frozen_encoder_feature_cache_is_explicitly_audited() -> None:
     disabled = _args("--config-only")
     enabled = _args("--config-only", "--freeze-observation-encoder")

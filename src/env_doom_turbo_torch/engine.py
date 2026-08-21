@@ -154,6 +154,11 @@ _NATIVE_SPRITE_MIN_DEPTH_FIXED = 2048 * 4
 # branch rather than the half-open endpoint owner of the selected seg.
 _NATIVE_SHARED_ENDPOINT_DEPTH_TOLERANCE = 1.0 / 16.0
 _NATIVE_PROJECTED_OWNER_MAX_WALL_LENGTH = 32.0
+# Bound the temporary [lane, row, column, edge] tensors used by the flat
+# polygon test.  Deathmatch sectors contain up to 62 edges; materializing all
+# of them at once exhausts a 24 GiB GPU during the 256-lane CUDA graph capture.
+# Even/odd containment composes exactly by XORing each chunk's parity.
+_NATIVE_FLAT_EDGE_CHUNK_SIZE = 8
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
 _CHAINSAW_SPREAD_RADIANS = 2.8125 * math.pi / 180.0
@@ -10992,27 +10997,31 @@ class TorchDeathmatchEngine:
             candidate_y = self.y[:, None, None] + ray_sin * candidate_distance
 
             edges = self._native_sector_edges[sector_index]
-            edge_x1 = edges[:, 0]
-            edge_y1 = edges[:, 1]
-            edge_x2 = edges[:, 2]
-            edge_y2 = edges[:, 3]
-            edge_dy = edge_y2 - edge_y1
-            safe_edge_dy = torch.where(
-                edge_dy.abs() < 1e-6,
-                torch.ones_like(edge_dy),
-                edge_dy,
-            )
+            inside = torch.zeros_like(candidate_x, dtype=torch.bool)
             point_x = candidate_x[..., None]
             point_y = candidate_y[..., None]
-            crosses_y = (edge_y1 > point_y) != (edge_y2 > point_y)
-            crossing_x = edge_x1 + (point_y - edge_y1) * (edge_x2 - edge_x1) / safe_edge_dy
-            inside = torch.remainder(
-                torch.sum(
-                    crosses_y & (point_x < crossing_x),
-                    dim=3,
-                ),
-                2,
-            ).bool()
+            for edge_start in range(0, len(edges), _NATIVE_FLAT_EDGE_CHUNK_SIZE):
+                edge_chunk = edges[edge_start : edge_start + _NATIVE_FLAT_EDGE_CHUNK_SIZE]
+                edge_x1 = edge_chunk[:, 0]
+                edge_y1 = edge_chunk[:, 1]
+                edge_x2 = edge_chunk[:, 2]
+                edge_y2 = edge_chunk[:, 3]
+                edge_dy = edge_y2 - edge_y1
+                safe_edge_dy = torch.where(
+                    edge_dy.abs() < 1e-6,
+                    torch.ones_like(edge_dy),
+                    edge_dy,
+                )
+                crosses_y = (edge_y1 > point_y) != (edge_y2 > point_y)
+                crossing_x = edge_x1 + (point_y - edge_y1) * (edge_x2 - edge_x1) / safe_edge_dy
+                chunk_inside = torch.remainder(
+                    torch.sum(
+                        crosses_y & (point_x < crossing_x),
+                        dim=3,
+                    ),
+                    2,
+                ).bool()
+                inside = torch.logical_xor(inside, chunk_inside)
             nearer = (
                 inside
                 & (plane_height > 0)

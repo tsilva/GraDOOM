@@ -343,3 +343,56 @@ Player-only evaluation evidence is retained at
 `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-fullbatch-lr8e6-4m-seed6841/eval-player-kills-final100-native-fused-seed10000.jsonl`;
 the baseline and next-best evidence use the same filename in their respective
 run directories.
+
+## Exact env-ViZDoom-turbo player-kill recount
+
+The 2026-08-21 recount uses `env-ViZDoom-turbo` commit
+`85f315bc4c89548dd810151f1790bcee026d1840`, whose
+`PLAYER_KILLCOUNT` increments only when `source->player` delivers a countable
+enemy's killing blow. Its engine and vector tests prove that map-wide/world
+kills do not increment the signal. All results below use the same 100 stochastic
+episodes, 16 balanced lanes, seed 10000, unchanged policy weights, Doom II IWAD,
+deathmatch WAD, action table, and game-seed grid in both providers.
+
+| Policy evidence lane | env-Doom player kills | env-ViZDoom player kills | Reference minus device | Paired 95% interval | env-Doom / env-ViZDoom map kills |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Historical adapted Nature, 4.03M | 25.51 | 37.91 | +12.40 | [+7.47, +17.33] | 28.93 / 40.32 |
+| Cold-start Nature, 17.34M | 14.01 | 14.04 | +0.03 | [-2.05, +2.11] | 15.60 / 15.88 |
+| Cold-start small ResNet, 31.92M | 17.16 | 15.66 | -1.50 | [-4.11, +1.11] | 18.57 / 17.54 |
+
+The historical checkpoint remains a warm-start evidence lane; it cannot certify
+the cold-start recipes. Re-evaluation with the native-fused renderer used for
+training corrects earlier local scratch results that were accidentally measured
+with the approximate renderer. Nature's entire paired interval is inside the
+canonical plus-or-minus 3.0 player-kill transfer margin. ResNet's mean difference
+is inside that margin, but its interval is not yet narrow enough for statistical
+equivalence. The long runs retain the transfer-tested native-fused renderer and
+must still measure both providers.
+
+Checkpoint SHA-256 values are `f4430d2ff5e08a651c6a52c22e426373c49dd5d55c93b6d6e0caf2906e0baddf`
+(historical Nature), `8257c58e51414b93b4e44e73ec0128e79ef7892092ed8053d132d99fc3ceb508`
+(cold-start Nature), and `c3c0f177eb9d0dea059935aed4cd9166d4472e621ad1c0295342253e0c4d6133`
+(cold-start small ResNet).
+
+## Canonical cold-start recipe and launch shape
+
+The retained Nature and small-ResNet recipes each train for 500 million
+transitions from random initialization, with no imported policy weights or
+privileged imitation. They preserve the authoritative GradLab PPO learning
+rate, 1,024-sample minibatch, two epochs, and one optimizer minibatch per 512
+environment transitions. The GPU-native launch shape scales the rollout from
+128 x 32 to 2,048 x 16, or 32,768 transitions per rollout, without changing
+that optimizer-update density. It uses the transfer-tested native-fused
+renderer and writes a resumable checkpoint every 128 rollouts (approximately
+4.19 million transitions).
+
+Short steady-state measurements on the RTX 4090 record 23,025.75 transitions/s
+for Nature and 18,245.31 transitions/s for small ResNet when each runs alone.
+That projects to 6.03 and 7.61 hours respectively, or 13.64 hours sequentially.
+When both jobs run concurrently, the corresponding rates are 15,204.01 and
+11,816.94 transitions/s. Concurrent execution therefore projects to 11.75
+hours for both results, saving about 1.89 hours (13.8%) of wall-clock time.
+Peak CUDA allocation is 3.12 GiB per process, so the two-job launch fits the
+24 GiB device with substantial memory headroom. The long seed-123 comparison is
+therefore launched concurrently; final quality comparisons remain based on the
+predeclared exact player-kill evaluations, not these throughput samples.

@@ -1,0 +1,59 @@
+schema: env-doom-turbo-torch/deathmatch-recipe-v1
+name: deathmatch-nature
+description: >-
+  Cold-start Nature CNN control for the proven 500M-transition GradLab PPO
+  horizon, using the GPU-resident native-fused renderer whose unchanged
+  scratch policy transfers within the predeclared tolerance. The larger
+  rollout preserves GradLab's minibatch, epochs, and update density while
+  saturating the Torch-native environment on the certified GPU.
+
+certification:
+  initialization: random
+  imported_policy_weights: false
+  privileged_imitation: false
+  training_seeds: [123, 456, 789, 1597, 6841]
+  minimum_passing_seeds: 4
+
+training:
+  timesteps: 500000000
+  seed: 123
+  num_envs: 2048
+  n_steps: 16
+  batch_size: 1024
+  n_epochs: 2
+  learning_rate: 0.00009375
+  ent_coef: 0.01
+  death_penalty: 2.0
+  wall_contact_damage_scale: 1.0
+  observation_renderer: native-fused
+  reward_shape: native-v1
+  privileged_imitation_coef: 0.0
+  encoder_anchor_coef: 0.0
+  precision: fp32
+  float32_matmul_precision: high
+  policy_architecture: nature
+  policy_memory_format: channels-last
+  fusion_activation: tanh
+  observation_blur_kernel: 1
+  observation_augmentation: none
+  freeze_observation_encoder: false
+  train_observation_projection_only: false
+  frozen_encoder_custom_conv: true
+  compile_policy: true
+  compile_engine: true
+  fused_optimizer: true
+  torch_permutation: true
+  steady_state_after_rollouts: 1
+  checkpoint_every_rollouts: 128
+
+evaluation:
+  providers: [env-Doom-turbo-torch, env-ViZDoom-turbo]
+  episodes: 100
+  num_envs: 16
+  seed: 10000
+  stochastic_actions: true
+  kills_signal: player_killcount
+  target_mean_player_kills: 30.0
+  transfer_practical_tolerance_mean_kills: 3.0
+  compatibility_kills_signal: killcount
+  compatibility_target_mean_kills: 31.78

@@ -24,6 +24,7 @@ import os
 import random
 import signal
 import statistics
+import sys
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -34,6 +35,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
 from torch import nn
 
 from env_doom_turbo_torch._triton_kernels import bounded_observation_augment, frozen_nature_conv1
@@ -42,6 +44,8 @@ REFERENCE_NAME = "GradLab VizdoomDeathmatch-v1/ppo"
 REFERENCE_CAPTURED_AT = "2026-08-11"
 ROLLING_EPISODES = 100
 REFERENCE_KILLS_TARGET = 31.78
+PLAYER_KILLS_TARGET = 30.0
+TRANSFER_PRACTICAL_TOLERANCE = 3.0
 GRADLAB_WANDB_PROJECT = "VizdoomDeathmatch-v1"
 GRADLAB_RETURN_METRIC = "train/episode/return/shaped/origin/target/rolling/mean"
 GRADLAB_KILLS_METRIC = "train/progress/kills/origin/target/rolling/mean"
@@ -202,6 +206,68 @@ POLICY_ARCHITECTURES = {
     "nature-quarter": PolicyArchitecture((8, 16, 16), 128, 128),
 }
 FUSION_ACTIVATIONS = ("tanh", "relu")
+DEATHMATCH_RECIPE_SCHEMA = "env-doom-turbo-torch/deathmatch-recipe-v1"
+DEATHMATCH_RECIPE_TOP_LEVEL_KEYS = frozenset(
+    {"schema", "name", "description", "certification", "training", "evaluation"}
+)
+DEATHMATCH_RECIPE_RUNTIME_KEYS = frozenset(
+    {
+        "config",
+        "config_only",
+        "iwad",
+        "scenario",
+        "metrics_jsonl",
+        "wandb",
+        "wandb_project",
+        "wandb_entity",
+        "wandb_group",
+        "wandb_tags",
+        "wandb_mode",
+        "run_name",
+        "run_description",
+        "checkpoint",
+        "resume",
+        "initialize_from",
+        "evaluate_checkpoint",
+        "evaluation_episodes",
+        "evaluation_num_envs",
+        "evaluation_seed",
+        "evaluation_stochastic",
+        "evaluation_survival_diagnostics",
+        "evaluation_action_diagnostics",
+    }
+)
+DEATHMATCH_RECIPE_REQUIRED_TRAINING_KEYS = frozenset(
+    {
+        "timesteps",
+        "seed",
+        "num_envs",
+        "n_steps",
+        "batch_size",
+        "n_epochs",
+        "learning_rate",
+        "ent_coef",
+        "wall_contact_damage_scale",
+        "observation_renderer",
+        "reward_shape",
+        "privileged_imitation_coef",
+        "encoder_anchor_coef",
+        "precision",
+        "float32_matmul_precision",
+        "policy_architecture",
+        "policy_memory_format",
+        "fusion_activation",
+        "observation_blur_kernel",
+        "observation_augmentation",
+        "freeze_observation_encoder",
+        "train_observation_projection_only",
+        "compile_policy",
+        "compile_engine",
+        "fused_optimizer",
+        "torch_permutation",
+        "checkpoint_every_rollouts",
+    }
+)
 
 # Keep the immutable GradLab recipe above as evidence, while using the measured
 # RTX 4090 sweet spot for new standalone runs.  Both shapes contain 4,096
@@ -244,6 +310,14 @@ SAMPLE_FACTORY_REWARD = SampleFactoryRewardConfig()
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train standalone PPO on env-Doom-turbo-torch's Deathmatch runtime.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "Canonical deathmatch YAML recipe. Explicit command-line options override "
+            "the recipe, but its cold-start and no-imitation invariants remain enforced."
+        ),
     )
     parser.add_argument(
         "--iwad",
@@ -572,6 +646,165 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _mapping(value: Any, *, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    return value
+
+
+def _load_deathmatch_recipe(path: Path) -> tuple[dict[str, Any], Path, str]:
+    source = path.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"deathmatch recipe does not exist: {source}")
+    loaded = yaml.safe_load(source.read_text(encoding="utf-8"))
+    recipe = dict(_mapping(loaded, label=f"deathmatch recipe {source}"))
+    unknown_top_level = set(recipe).difference(DEATHMATCH_RECIPE_TOP_LEVEL_KEYS)
+    if unknown_top_level:
+        raise ValueError(f"unsupported deathmatch recipe keys: {sorted(unknown_top_level)}")
+    if recipe.get("schema") != DEATHMATCH_RECIPE_SCHEMA:
+        raise ValueError(f"deathmatch recipe schema must be {DEATHMATCH_RECIPE_SCHEMA!r}")
+    name = recipe.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("deathmatch recipe name must be a non-empty string")
+
+    certification = _mapping(recipe.get("certification"), label="recipe certification")
+    training_seeds = certification.get("training_seeds")
+    if (
+        not isinstance(training_seeds, list)
+        or len(training_seeds) != 5
+        or len(set(training_seeds)) != 5
+        or any(
+            not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed <= UINT32_MASK
+            for seed in training_seeds
+        )
+    ):
+        raise ValueError("recipe certification must declare five distinct uint32 training seeds")
+    if certification.get("minimum_passing_seeds") != 4:
+        raise ValueError("recipe certification must require four of five passing seeds")
+    if certification.get("initialization") != "random":
+        raise ValueError("deathmatch recipes must certify random initialization")
+    if certification.get("imported_policy_weights") is not False:
+        raise ValueError("deathmatch recipes must prohibit imported policy weights")
+    if certification.get("privileged_imitation") is not False:
+        raise ValueError("deathmatch recipes must prohibit privileged imitation")
+
+    evaluation = _mapping(recipe.get("evaluation"), label="recipe evaluation")
+    if evaluation.get("providers") != [
+        "env-Doom-turbo-torch",
+        "env-ViZDoom-turbo",
+    ]:
+        raise ValueError(
+            "recipe evaluation providers must be env-Doom-turbo-torch and "
+            "env-ViZDoom-turbo in that order"
+        )
+    if evaluation.get("kills_signal") != "player_killcount":
+        raise ValueError("deathmatch recipes must evaluate exact player-attributed kills")
+    if evaluation.get("compatibility_kills_signal") != "killcount":
+        raise ValueError(
+            "deathmatch recipes must retain ViZDoom KILLCOUNT as a compatibility signal"
+        )
+    if float(evaluation.get("target_mean_player_kills", math.nan)) != PLAYER_KILLS_TARGET:
+        raise ValueError(f"recipe player-kill target must be {PLAYER_KILLS_TARGET}")
+    if (
+        float(evaluation.get("transfer_practical_tolerance_mean_kills", math.nan))
+        != TRANSFER_PRACTICAL_TOLERANCE
+    ):
+        raise ValueError(
+            "recipe transfer tolerance must be predeclared as "
+            f"{TRANSFER_PRACTICAL_TOLERANCE} mean player kills"
+        )
+    compatibility_target = evaluation.get("compatibility_target_mean_kills")
+    if (
+        isinstance(compatibility_target, bool)
+        or not isinstance(compatibility_target, (int, float))
+        or not math.isfinite(float(compatibility_target))
+        or float(compatibility_target) != REFERENCE_KILLS_TARGET
+    ):
+        raise ValueError(
+            "recipe compatibility target must preserve the historical "
+            f"ViZDoom KILLCOUNT mean of {REFERENCE_KILLS_TARGET}"
+        )
+    if int(evaluation.get("episodes", 0)) != 100:
+        raise ValueError("recipe evaluation must use exactly 100 episodes")
+    if int(evaluation.get("num_envs", 0)) != 16:
+        raise ValueError("recipe evaluation must use exactly 16 lanes")
+    if evaluation.get("stochastic_actions") is not True:
+        raise ValueError("recipe evaluation must use stochastic actions")
+
+    training = _mapping(recipe.get("training"), label="recipe training")
+    missing_training = DEATHMATCH_RECIPE_REQUIRED_TRAINING_KEYS.difference(training)
+    if missing_training:
+        raise ValueError(f"deathmatch recipe omits training keys: {sorted(missing_training)}")
+    runtime_training = DEATHMATCH_RECIPE_RUNTIME_KEYS.intersection(training)
+    if runtime_training:
+        raise ValueError(
+            f"deathmatch recipe cannot contain runtime/output keys: {sorted(runtime_training)}"
+        )
+    if float(training.get("privileged_imitation_coef", -1.0)) != 0.0:
+        raise ValueError("deathmatch recipe privileged_imitation_coef must be zero")
+    if int(training.get("seed", -1)) not in training_seeds:
+        raise ValueError("recipe training seed must be one of its predeclared certification seeds")
+    return recipe, source, _file_sha256(source)
+
+
+def _deathmatch_recipe_tokens(
+    recipe: Mapping[str, Any],
+    parser: argparse.ArgumentParser,
+) -> list[str]:
+    training = _mapping(recipe["training"], label="recipe training")
+    actions = {action.dest: action for action in parser._actions}
+    unknown_training = set(training).difference(actions)
+    if unknown_training:
+        raise ValueError(f"unsupported deathmatch recipe training keys: {sorted(unknown_training)}")
+    tokens: list[str] = []
+    for key, value in training.items():
+        action = actions[key]
+        positive_options = [
+            option
+            for option in action.option_strings
+            if option.startswith("--") and not option.startswith("--no-")
+        ]
+        if not positive_options:  # pragma: no cover - all recipe fields are long options
+            raise ValueError(f"recipe field {key!r} has no long command-line option")
+        option = positive_options[0]
+        if isinstance(action, argparse.BooleanOptionalAction):
+            if not isinstance(value, bool):
+                raise ValueError(f"recipe field {key!r} must be a boolean")
+            tokens.append(option if value else f"--no-{option.removeprefix('--')}")
+        elif isinstance(value, bool):
+            raise ValueError(f"recipe field {key!r} cannot be a boolean")
+        elif isinstance(value, (str, int, float)):
+            tokens.extend((option, str(value)))
+        else:
+            raise ValueError(f"recipe field {key!r} must be a scalar")
+    return tokens
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    explicit = list(sys.argv[1:] if argv is None else argv)
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--config", type=Path)
+    selected, _unknown = probe.parse_known_args(explicit)
+    parser = _parser()
+    recipe_metadata: dict[str, Any] | None = None
+    recipe_tokens: list[str] = []
+    if selected.config is not None:
+        recipe, source, source_sha256 = _load_deathmatch_recipe(selected.config)
+        recipe_tokens = _deathmatch_recipe_tokens(recipe, parser)
+        recipe_metadata = {
+            "name": str(recipe["name"]),
+            "schema": str(recipe["schema"]),
+            "path": str(source),
+            "sha256": source_sha256,
+            "certification": dict(_mapping(recipe["certification"], label="certification")),
+            "evaluation": dict(_mapping(recipe["evaluation"], label="evaluation")),
+            "training": dict(_mapping(recipe["training"], label="training")),
+        }
+    args = parser.parse_args([*recipe_tokens, *explicit])
+    args.recipe_metadata = recipe_metadata
+    return args
+
+
 def _validate_positive(value: int, name: str) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
@@ -607,6 +840,20 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("death-penalty must be finite and non-negative")
     if not math.isfinite(args.privileged_imitation_coef) or args.privileged_imitation_coef < 0.0:
         raise ValueError("privileged-imitation-coef must be finite and non-negative")
+    recipe_metadata = getattr(args, "recipe_metadata", None)
+    if recipe_metadata is not None:
+        if float(args.privileged_imitation_coef) != 0.0:
+            raise ValueError("canonical deathmatch recipes prohibit privileged imitation")
+        if args.initialize_from is not None:
+            raise ValueError("canonical deathmatch recipes prohibit imported policy weights")
+        if float(args.wall_contact_damage_scale) != 1.0:
+            raise ValueError("canonical deathmatch recipes require unmodified wall damage")
+        certification = _mapping(
+            recipe_metadata.get("certification"),
+            label="recipe certification",
+        )
+        if int(args.seed) not in certification["training_seeds"]:
+            raise ValueError("training seed is not predeclared by the canonical recipe")
     if not math.isfinite(args.encoder_anchor_coef) or args.encoder_anchor_coef < 0.0:
         raise ValueError("encoder-anchor-coef must be finite and non-negative")
     if args.encoder_anchor_coef > 0.0 and bool(args.freeze_observation_encoder):
@@ -640,9 +887,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         and bool(args.freeze_observation_encoder)
         and bool(args.frozen_encoder_custom_conv)
     ):
-        raise ValueError(
-            "resnet-small is incompatible with the frozen-encoder custom convolution"
-        )
+        raise ValueError("resnet-small is incompatible with the frozen-encoder custom convolution")
     rollout_transitions = int(args.num_envs) * int(args.n_steps)
     if int(args.batch_size) > rollout_transitions:
         raise ValueError("batch-size cannot exceed num-envs * n-steps")
@@ -650,7 +895,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         destination = _checkpoint_destination(args.checkpoint)
         if destination.exists():
             raise FileExistsError(f"refusing to overwrite checkpoint: {destination}")
-    elif args.checkpoint_every_rollouts:
+    elif args.checkpoint_every_rollouts and not args.config_only:
         raise ValueError("checkpoint-every-rollouts requires --checkpoint")
     if args.resume is not None:
         args.resume = _checkpoint_destination(args.resume)
@@ -730,11 +975,13 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
         "compile_engine": bool(args.compile_engine),
         "fused_optimizer": bool(args.fused_optimizer),
         "torch_permutation": bool(args.torch_permutation),
+        "steady_state_after_rollouts": int(args.steady_state_after_rollouts),
+        "checkpoint_every_rollouts": int(args.checkpoint_every_rollouts),
         "initialize_from": initialization_checkpoint,
         "initialize_from_sha256": initialization_sha256,
     }
     canonical = json.dumps(effective, sort_keys=True, separators=(",", ":"))
-    return {
+    audit = {
         "type": "config",
         "contract": "standalone-env_doom_turbo_torch-deathmatch-ppo-v2",
         "operation": "evaluate" if args.evaluate_checkpoint is not None else "train",
@@ -804,8 +1051,10 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "action_diagnostics": bool(args.evaluation_action_diagnostics),
             "kills_signal": "player_killcount",
             "vizdoom_compatibility_kills_signal": "killcount",
-            "kills_target": REFERENCE_KILLS_TARGET,
-            "kills_target_signal": "killcount",
+            "kills_target": PLAYER_KILLS_TARGET,
+            "kills_target_signal": "player_killcount",
+            "vizdoom_compatibility_kills_target": REFERENCE_KILLS_TARGET,
+            "transfer_practical_tolerance_mean_kills": (TRANSFER_PRACTICAL_TOLERANCE),
         },
         "effective_recipe": effective,
         "policy_model": {
@@ -862,7 +1111,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "episode_timeout": REFERENCE_RECIPE.episode_timeout,
             "frame_skip": REFERENCE_RECIPE.frame_skip,
             "frame_stack": FRAME_STACK,
-            "episode_seed_protocol": "gradlab-vizdoom-turbo-v1",
+            "episode_seed_protocol": "gradlab-env-vizdoom-turbo-v1",
             "observation_shape": [4, 84, 84],
             "observation_grayscale": True,
             "observation_layout": "chw",
@@ -882,6 +1131,21 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "wandb_metrics": list(GRADLAB_WANDB_METRICS),
         },
     }
+    recipe_metadata = getattr(args, "recipe_metadata", None)
+    if recipe_metadata is not None:
+        source_training = _mapping(recipe_metadata["training"], label="recipe training")
+        overrides = {
+            key: {"recipe": value, "effective": getattr(args, key)}
+            for key, value in source_training.items()
+            if getattr(args, key) != value
+        }
+        audit["source_recipe"] = {
+            key: value for key, value in recipe_metadata.items() if key != "training"
+        }
+        audit["source_recipe"]["overrides"] = overrides
+    else:
+        audit["source_recipe"] = None
+    return audit
 
 
 class JsonEmitter:
@@ -1606,6 +1870,17 @@ def _checkpoint_policy_kwargs(loaded: Mapping[str, Any]) -> dict[str, str | int]
     }
 
 
+def _is_evaluation_checkpoint(loaded: object) -> bool:
+    """Accept current and pre-rename standalone policies for read-only evaluation."""
+    if not isinstance(loaded, Mapping):
+        return False
+    checkpoint_format = loaded.get("format")
+    return isinstance(checkpoint_format, str) and (
+        checkpoint_format == "standalone-env_doom_turbo_torch-ppo-v1"
+        or (checkpoint_format.startswith("standalone-") and checkpoint_format.endswith("-ppo-v1"))
+    )
+
+
 def _load_policy_initialization(
     policy: NatureActorCritic,
     loaded: Mapping[str, Any],
@@ -1625,9 +1900,7 @@ def _load_policy_initialization(
         )
     incompatible = policy.load_state_dict(state_dict, strict=False)
     expected_missing = {
-        name
-        for name in policy.state_dict()
-        if name.startswith("observation_encoder.residual_")
+        name for name in policy.state_dict() if name.startswith("observation_encoder.residual_")
     }
     if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
         raise ValueError(
@@ -2339,6 +2612,7 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     step: int,
     audit: Mapping[str, Any],
+    training_lineage: Mapping[str, Any],
     training_state: Mapping[str, Any] | None = None,
 ) -> Path:
     destination = _checkpoint_destination(path)
@@ -2352,6 +2626,7 @@ def _save_checkpoint(
             "policy_state_dict": policy.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": dict(audit),
+            "training_lineage": dict(training_lineage),
             "training_state": dict(training_state or {}),
         },
         destination,
@@ -2370,6 +2645,76 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _training_lineage(
+    args: argparse.Namespace,
+    resume_payload: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Preserve cold-start provenance across optimizer/RNG checkpoint resumes."""
+    if resume_payload is not None:
+        inherited = resume_payload.get("training_lineage")
+        if isinstance(inherited, Mapping):
+            return dict(inherited)
+        return {
+            "schema": "env-doom-turbo-torch/training-lineage-v1",
+            "provenance_complete": False,
+            "root_initialization": None,
+            "imported_policy_weights": None,
+            "reason": "resumed checkpoint predates explicit lineage metadata",
+        }
+    initialization_checkpoint = None if args.initialize_from is None else str(args.initialize_from)
+    recipe_metadata = getattr(args, "recipe_metadata", None)
+    return {
+        "schema": "env-doom-turbo-torch/training-lineage-v1",
+        "provenance_complete": True,
+        "root_initialization": {
+            "mode": ("random" if initialization_checkpoint is None else "imported-policy-weights"),
+            "checkpoint": initialization_checkpoint,
+            "checkpoint_sha256": (
+                None if args.initialize_from is None else _file_sha256(args.initialize_from)
+            ),
+        },
+        "imported_policy_weights": initialization_checkpoint is not None,
+        "source_recipe": (
+            None
+            if recipe_metadata is None
+            else {
+                "name": recipe_metadata["name"],
+                "sha256": recipe_metadata["sha256"],
+            }
+        ),
+        "training_seed": int(args.seed),
+        "policy_architecture": str(args.policy_architecture),
+    }
+
+
+def _validate_canonical_resume(
+    args: argparse.Namespace,
+    loaded: Mapping[str, Any],
+) -> None:
+    recipe_metadata = getattr(args, "recipe_metadata", None)
+    if recipe_metadata is None:
+        return
+    lineage = loaded.get("training_lineage")
+    if not isinstance(lineage, Mapping) or lineage.get("provenance_complete") is not True:
+        raise ValueError("canonical recipe resume requires complete checkpoint lineage")
+    if lineage.get("imported_policy_weights") is not False:
+        raise ValueError("canonical recipe resume cannot descend from imported policy weights")
+    root = lineage.get("root_initialization")
+    if not isinstance(root, Mapping) or root.get("mode") != "random":
+        raise ValueError("canonical recipe resume must descend from random initialization")
+    source_recipe = lineage.get("source_recipe")
+    expected_recipe = {
+        "name": recipe_metadata["name"],
+        "sha256": recipe_metadata["sha256"],
+    }
+    if source_recipe != expected_recipe:
+        raise ValueError("canonical recipe resume checkpoint uses a different recipe")
+    if int(lineage.get("training_seed", -1)) != int(args.seed):
+        raise ValueError("canonical recipe resume checkpoint uses a different training seed")
+    if lineage.get("policy_architecture") != str(args.policy_architecture):
+        raise ValueError("canonical recipe resume checkpoint uses a different architecture")
 
 
 def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -2397,9 +2742,14 @@ def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "evaluation/vizdoom_killcount/max": max(vizdoom_killcounts),
         "evaluation/return/native/mean": statistics.fmean(returns),
         "evaluation/episode/length/mean": statistics.fmean(lengths),
-        "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
-        "evaluation/target/kills/signal": "killcount",
-        "evaluation/target/passed": mean_vizdoom_killcount >= REFERENCE_KILLS_TARGET,
+        "evaluation/target/kills/mean": PLAYER_KILLS_TARGET,
+        "evaluation/target/kills/signal": "player_killcount",
+        "evaluation/target/passed": mean_kills >= PLAYER_KILLS_TARGET,
+        "evaluation/compatibility_target/kills/mean": REFERENCE_KILLS_TARGET,
+        "evaluation/compatibility_target/kills/signal": "killcount",
+        "evaluation/compatibility_target/passed": (
+            mean_vizdoom_killcount >= REFERENCE_KILLS_TARGET
+        ),
     }
     if all("damage_taken" in record and "hits_taken" in record for record in records):
         damage_taken = [float(record["damage_taken"]) for record in records]
@@ -2476,10 +2826,7 @@ def _evaluate(
     env = _make_env(args, device, num_envs=evaluation_envs)
     try:
         loaded = torch.load(args.evaluate_checkpoint, map_location=device, weights_only=False)
-        if (
-            not isinstance(loaded, Mapping)
-            or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
-        ):
+        if not _is_evaluation_checkpoint(loaded):
             raise ValueError(f"unsupported evaluation checkpoint: {args.evaluate_checkpoint}")
         policy = NatureActorCritic(
             str(args.policy_architecture),
@@ -2592,7 +2939,7 @@ def _evaluate(
                 "episodes": int(args.evaluation_episodes),
                 "num_envs": evaluation_envs,
                 "episode_quotas": list(episode_quotas),
-                "seed_grid": "gradlab-vizdoom-turbo-v1 lanes x episode-index",
+                "seed_grid": "gradlab-env-vizdoom-turbo-v1 lanes x episode-index",
                 "deterministic_actions": not bool(args.evaluation_stochastic),
                 "kills_signal": "player_killcount",
             }
@@ -2746,6 +3093,7 @@ def _evaluate(
                 "checkpoint_sha256": _file_sha256(args.evaluate_checkpoint),
                 "checkpoint_step": int(loaded.get("step", 0)),
                 "checkpoint_config": loaded.get("config"),
+                "checkpoint_training_lineage": loaded.get("training_lineage"),
                 "evaluation_config": audit["evaluation"],
                 "deterministic_actions": not bool(args.evaluation_stochastic),
                 "episode_quotas": list(episode_quotas),
@@ -2865,6 +3213,7 @@ def _train(
                 or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
             ):
                 raise ValueError(f"unsupported resume checkpoint: {args.resume}")
+            _validate_canonical_resume(args, loaded)
             policy.load_state_dict(loaded["policy_state_dict"])
             _load_optimizer_state(
                 optimizer,
@@ -2872,6 +3221,7 @@ def _train(
                 learning_rate=float(args.learning_rate),
             )
             resume_payload = loaded
+        training_lineage = _training_lineage(args, resume_payload)
         encoder_anchors = (
             tuple(
                 (parameter, parameter.detach().clone())
@@ -3205,6 +3555,7 @@ def _train(
                     optimizer=optimizer,
                     step=global_step,
                     audit=audit,
+                    training_lineage=training_lineage,
                     training_state=checkpoint_training_state(),
                 )
                 emitter.emit(
@@ -3226,6 +3577,7 @@ def _train(
                 optimizer=optimizer,
                 step=global_step,
                 audit=audit,
+                training_lineage=training_lineage,
                 training_state=checkpoint_training_state(),
             )
         torch.cuda.synchronize(device)
@@ -3283,7 +3635,7 @@ def _train(
 
 def main(argv: Sequence[str] | None = None) -> int:
     process_started = time.perf_counter()
-    args = _parser().parse_args(argv)
+    args = _parse_args(argv)
     _validate_args(args)
     if args.evaluate_checkpoint is not None:
         checkpoint_metadata = torch.load(
@@ -3291,11 +3643,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             map_location="cpu",
             weights_only=False,
         )
-        if (
-            not isinstance(checkpoint_metadata, Mapping)
-            or checkpoint_metadata.get("format")
-            != "standalone-env_doom_turbo_torch-ppo-v1"
-        ):
+        if not _is_evaluation_checkpoint(checkpoint_metadata):
             raise ValueError(f"unsupported evaluation checkpoint: {args.evaluate_checkpoint}")
         checkpoint_policy = _checkpoint_policy_kwargs(checkpoint_metadata)
         args.policy_architecture = checkpoint_policy["architecture"]

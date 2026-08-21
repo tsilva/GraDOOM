@@ -10,7 +10,7 @@ from env_doom_turbo_torch.actions import (
 )
 
 
-def test_pinned_action_table_matches_vizdoom_turbo() -> None:
+def test_pinned_action_table_matches_env_vizdoom_turbo() -> None:
     assert len(DEATHMATCH_ACTIONS) == 17
     assert DEATHMATCH_ACTION_MEANINGS[0] == "noop"
     assert DEATHMATCH_ACTION_MEANINGS[13] == "attack_turn_left"

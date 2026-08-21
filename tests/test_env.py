@@ -55,6 +55,7 @@ def test_player_killcount_is_an_explicit_device_and_info_signal(square_scenario)
         _observations, infos = env.reset(seed=[1, 2])
         player_index = env.device_signal_names.index("player_killcount")
 
+        assert env.metadata["player_killcount_semantics"] == "source-player-enemy-kills-v1"
         assert player_index == len(env.device_signal_names) - 1
         assert infos["killcount"].tolist() == [0.0, 0.0]
         assert infos["player_killcount"].tolist() == [0.0, 0.0]

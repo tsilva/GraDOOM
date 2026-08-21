@@ -219,6 +219,7 @@ class EnvDoomTurboTorchVecEnv(VectorEnv):
         "turbo_api_version": 2,
         "transition_transport": "torch",
         "env_doom_turbo_torch_device_api_version": 1,
+        "player_killcount_semantics": "source-player-enemy-kills-v1",
     }
     supports_live_snapshots = False
     live_snapshots_deterministic = False

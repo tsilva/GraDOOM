@@ -40,6 +40,125 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     assert args.observation_augmentation == "none"
 
 
+def test_evaluation_accepts_current_and_pre_rename_standalone_checkpoints() -> None:
+    assert train._is_evaluation_checkpoint({"format": "standalone-env_doom_turbo_torch-ppo-v1"})
+    assert train._is_evaluation_checkpoint({"format": "standalone-pre-rename-ppo-v1"})
+    assert not train._is_evaluation_checkpoint({"format": "standalone-pre-rename-ppo-v2"})
+    assert not train._is_evaluation_checkpoint({})
+
+
+def test_exactly_two_canonical_deathmatch_recipes_are_cold_start_and_matched() -> None:
+    recipe_dir = Path(__file__).parents[1] / "recipes"
+    paths = sorted(recipe_dir.glob("deathmatch*.yaml"))
+
+    assert [path.name for path in paths] == [
+        "deathmatch-nature.yaml",
+        "deathmatch-resnet-small.yaml",
+    ]
+
+    audits = []
+    for path in paths:
+        args = train._parse_args(("--config", str(path), "--config-only"))
+        train._validate_args(args)
+        audit = train._audit_config(args)
+        audits.append(audit)
+
+        assert audit["initialization"] == {
+            "checkpoint": None,
+            "checkpoint_sha256": None,
+            "mode": "random",
+        }
+        assert audit["effective_recipe"]["timesteps"] == 500_000_000
+        assert audit["effective_recipe"]["num_envs"] == 2048
+        assert audit["effective_recipe"]["n_steps"] == 16
+        assert audit["effective_recipe"]["batch_size"] == 1024
+        assert audit["effective_recipe"]["n_epochs"] == 2
+        assert audit["effective_recipe"]["learning_rate"] == 9.375e-5
+        assert audit["effective_recipe"]["checkpoint_every_rollouts"] == 128
+        assert audit["effective_recipe"]["observation_renderer"] == "native-fused"
+        assert audit["effective_recipe"]["reward_shape"] == "native-v1"
+        assert audit["effective_recipe"]["privileged_imitation_coef"] == 0.0
+        assert audit["effective_recipe"]["wall_contact_damage_scale"] == 1.0
+        assert audit["effective_recipe"]["fusion_activation"] == "tanh"
+        assert audit["source_recipe"]["certification"]["training_seeds"] == [
+            123,
+            456,
+            789,
+            1597,
+            6841,
+        ]
+        assert audit["source_recipe"]["certification"]["minimum_passing_seeds"] == 4
+        assert audit["source_recipe"]["evaluation"] == {
+            "providers": ["env-Doom-turbo-torch", "env-ViZDoom-turbo"],
+            "episodes": 100,
+            "num_envs": 16,
+            "seed": 10000,
+            "stochastic_actions": True,
+            "kills_signal": "player_killcount",
+            "target_mean_player_kills": 30.0,
+            "transfer_practical_tolerance_mean_kills": 3.0,
+            "compatibility_kills_signal": "killcount",
+            "compatibility_target_mean_kills": 31.78,
+        }
+        assert audit["source_recipe"]["overrides"] == {}
+
+    nature = audits[0]["effective_recipe"]
+    resnet = audits[1]["effective_recipe"]
+    assert nature["policy_architecture"] == "nature"
+    assert resnet["policy_architecture"] == "resnet-small"
+    assert {key: value for key, value in nature.items() if key != "policy_architecture"} == {
+        key: value for key, value in resnet.items() if key != "policy_architecture"
+    }
+
+
+def test_canonical_recipe_allows_only_predeclared_seed_and_audits_override() -> None:
+    recipe = Path(__file__).parents[1] / "recipes" / "deathmatch-nature.yaml"
+    args = train._parse_args(("--config", str(recipe), "--seed", "456", "--config-only"))
+
+    train._validate_args(args)
+    audit = train._audit_config(args)
+
+    assert audit["effective_recipe"]["seed"] == 456
+    assert audit["source_recipe"]["overrides"] == {"seed": {"recipe": 123, "effective": 456}}
+    with pytest.raises(ValueError, match="not predeclared"):
+        train._validate_args(
+            train._parse_args(("--config", str(recipe), "--seed", "999", "--config-only"))
+        )
+
+
+def test_canonical_recipe_rejects_imitation_imports_and_modified_wall_damage() -> None:
+    recipe = Path(__file__).parents[1] / "recipes" / "deathmatch-nature.yaml"
+    cases = (
+        (("--privileged-imitation-coef", "0.1"), "prohibit privileged imitation"),
+        (("--initialize-from", "/tmp/imported.pt"), "prohibit imported policy weights"),
+        (("--wall-contact-damage-scale", "0.25"), "unmodified wall damage"),
+    )
+
+    for extra, message in cases:
+        args = train._parse_args(("--config", str(recipe), *extra, "--config-only"))
+        with pytest.raises(ValueError, match=message):
+            train._validate_args(args)
+
+
+def test_canonical_checkpoint_lineage_survives_resume_and_rejects_legacy_roots() -> None:
+    recipe = Path(__file__).parents[1] / "recipes" / "deathmatch-resnet-small.yaml"
+    args = train._parse_args(("--config", str(recipe), "--seed", "789", "--config-only"))
+    lineage = train._training_lineage(args, None)
+
+    assert lineage["provenance_complete"] is True
+    assert lineage["imported_policy_weights"] is False
+    assert lineage["root_initialization"]["mode"] == "random"
+    assert lineage["policy_architecture"] == "resnet-small"
+    train._validate_canonical_resume(args, {"training_lineage": lineage})
+    assert train._training_lineage(args, {"training_lineage": lineage}) == lineage
+
+    with pytest.raises(ValueError, match="complete checkpoint lineage"):
+        train._validate_canonical_resume(args, {"config": {}})
+    imported = {**lineage, "imported_policy_weights": True}
+    with pytest.raises(ValueError, match="imported policy weights"):
+        train._validate_canonical_resume(args, {"training_lineage": imported})
+
+
 def test_observation_blur_is_audited_and_rejects_even_kernels() -> None:
     args = _args("--observation-blur-kernel", "9")
     train._validate_args(args)
@@ -60,8 +179,7 @@ def test_bounded_observation_augmentation_is_training_only_and_audited() -> None
 
     assert audit["effective_recipe"]["observation_augmentation"] == "bounded-shift-gray-v1"
     assert (
-        audit["policy_model"]["training_only_observation_augmentation"]
-        == "bounded-shift-gray-v1"
+        audit["policy_model"]["training_only_observation_augmentation"] == "bounded-shift-gray-v1"
     )
 
 
@@ -573,9 +691,12 @@ def test_evaluation_aggregate_uses_exact_records_and_reference_target() -> None:
     assert result["evaluation/kills/std"] == 2.0
     assert result["evaluation/kills/signal"] == "player_killcount"
     assert result["evaluation/vizdoom_killcount/mean"] == 31.0
-    assert result["evaluation/target/kills/mean"] == 31.78
-    assert result["evaluation/target/kills/signal"] == "killcount"
-    assert result["evaluation/target/passed"] is False
+    assert result["evaluation/target/kills/mean"] == 30.0
+    assert result["evaluation/target/kills/signal"] == "player_killcount"
+    assert result["evaluation/target/passed"] is True
+    assert result["evaluation/compatibility_target/kills/mean"] == 31.78
+    assert result["evaluation/compatibility_target/kills/signal"] == "killcount"
+    assert result["evaluation/compatibility_target/passed"] is False
 
 
 def test_evaluation_aggregate_rejects_no_completed_episodes() -> None:

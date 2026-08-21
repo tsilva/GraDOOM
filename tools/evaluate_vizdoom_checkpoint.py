@@ -25,6 +25,7 @@ UINT32_MASK = (1 << 32) - 1
 DEFAULT_EPISODES = 100
 DEFAULT_NUM_ENVS = 16
 REFERENCE_KILLS_TARGET = 31.78
+PLAYER_KILLS_TARGET = 30.0
 REFERENCE_RENDER_HUD = True
 TRACE_GAME_VARIABLES = (
     "POSITION_X",
@@ -36,15 +37,31 @@ TRACE_GAME_VARIABLES = (
 TRACE_INFO_NAMES = tuple(name.casefold() for name in TRACE_GAME_VARIABLES)
 SURVIVAL_GAME_VARIABLES = ("HITS_TAKEN", "DAMAGE_TAKEN")
 SURVIVAL_INFO_NAMES = tuple(name.casefold() for name in SURVIVAL_GAME_VARIABLES)
-ENV_DOOM_TURBO_TORCH_ONLY_SIGNAL_NAMES = frozenset({"player_killcount"})
+REQUIRED_PLAYER_KILLS_SIGNAL = "player_killcount"
+CURRENT_CHECKPOINT_FORMAT = "standalone-env_doom_turbo_torch-ppo-v1"
 
 
 def _reference_signal_names(names: Sequence[str]) -> tuple[str, ...]:
-    """Remove env-Doom-turbo-torch-only diagnostics from a ViZDoom provider contract."""
+    """Return the common transfer signals, including exact player-attributed kills."""
 
-    return tuple(
-        name for name in names if str(name).casefold() not in ENV_DOOM_TURBO_TORCH_ONLY_SIGNAL_NAMES
-    )
+    return tuple(names)
+
+
+def _checkpoint_format_lane(loaded: Any) -> str:
+    if not isinstance(loaded, Mapping):
+        raise ValueError("checkpoint payload must be a mapping")
+    if loaded.get("format") == CURRENT_CHECKPOINT_FORMAT:
+        return "current"
+    format_name = loaded.get("format")
+    if (
+        isinstance(format_name, str)
+        and format_name.startswith("standalone-")
+        and format_name.endswith("-ppo-v1")
+        and isinstance(loaded.get("policy_state_dict"), Mapping)
+        and isinstance(loaded.get("config"), Mapping)
+    ):
+        return "legacy-pre-rename"
+    raise ValueError("unsupported standalone checkpoint payload")
 
 
 def _load_standalone_train() -> ModuleType:
@@ -145,6 +162,8 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     if not kills:
         raise ValueError("zero-shot evaluation requires completed episodes")
     mean_kills = statistics.fmean(kills)
+    vizdoom_killcounts = [float(record["vizdoom_killcount"]) for record in records]
+    mean_vizdoom_killcount = statistics.fmean(vizdoom_killcounts)
     summary = {
         "evaluation/episode/count": len(records),
         "evaluation/kills/mean": mean_kills,
@@ -152,11 +171,22 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "evaluation/kills/std": statistics.pstdev(kills),
         "evaluation/kills/min": min(kills),
         "evaluation/kills/max": max(kills),
+        "evaluation/kills/signal": REQUIRED_PLAYER_KILLS_SIGNAL,
+        "evaluation/vizdoom_killcount/mean": mean_vizdoom_killcount,
+        "evaluation/vizdoom_killcount/median": statistics.median(vizdoom_killcounts),
+        "evaluation/vizdoom_killcount/min": min(vizdoom_killcounts),
+        "evaluation/vizdoom_killcount/max": max(vizdoom_killcounts),
         "evaluation/episode/length/mean": statistics.fmean(
             float(record["length"]) for record in records
         ),
-        "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
-        "evaluation/target/passed": mean_kills >= REFERENCE_KILLS_TARGET,
+        "evaluation/target/kills/mean": PLAYER_KILLS_TARGET,
+        "evaluation/target/kills/signal": REQUIRED_PLAYER_KILLS_SIGNAL,
+        "evaluation/target/passed": mean_kills >= PLAYER_KILLS_TARGET,
+        "evaluation/compatibility_target/kills/mean": REFERENCE_KILLS_TARGET,
+        "evaluation/compatibility_target/kills/signal": "killcount",
+        "evaluation/compatibility_target/passed": (
+            mean_vizdoom_killcount >= REFERENCE_KILLS_TARGET
+        ),
     }
     if all("damage_taken" in record and "hits_taken" in record for record in records):
         damage_taken = [float(record["damage_taken"]) for record in records]
@@ -210,11 +240,12 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
     try:
-        from vizdoom_turbo import VizdoomTurboVecEnv
+        import env_vizdoom_turbo
     except ImportError as exc:
         raise RuntimeError(
             "zero-shot evaluation requires env-vizdoom-turbo in the selected Python runtime"
         ) from exc
+    EnvViZDoomTurboVecEnv = env_vizdoom_turbo.EnvViZDoomTurboVecEnv
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for standalone checkpoint policy inference")
 
@@ -243,46 +274,53 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         *_reference_signal_names(train.INFO_SIGNALS),
         *extra_info_names,
     )
-    env = VizdoomTurboVecEnv(
-        str(args.scenario_config),
-        use_restricted_actions=train.RESTRICTED_ACTIONS,
-        rom_path=str(args.iwad),
-        num_envs=num_envs,
-        num_threads=num_envs,
-        obs_resize=(84, 84),
-        obs_crop=(0, 32, 0, 0),
-        obs_crop_mode="mask",
-        obs_crop_fill=0,
-        obs_grayscale=True,
-        obs_layout="chw",
-        obs_copy="safe_view",
-        obs_resize_algorithm="area",
-        frame_skip=train.REFERENCE_RECIPE.frame_skip,
-        frame_stack=train.FRAME_STACK,
-        maxpool_last_two=False,
-        noop_reset_max=0,
-        sticky_action_prob=0.0,
-        reward_clip=False,
-        info="data",
-        info_filter={"mode": "all", "keys": list(info_keys)},
-        doom_skill=train.REFERENCE_RECIPE.doom_skill,
-        game_variables=game_variables,
-        treat_episode_timeout_as_truncation=True,
-        vizdoom_config={
-            "episode_timeout": train.REFERENCE_RECIPE.episode_timeout,
-            "render_hud": REFERENCE_RENDER_HUD,
-        },
-    )
+    try:
+        env = EnvViZDoomTurboVecEnv(
+            str(args.scenario_config),
+            use_restricted_actions=train.RESTRICTED_ACTIONS,
+            rom_path=str(args.iwad),
+            num_envs=num_envs,
+            num_threads=num_envs,
+            obs_resize=(84, 84),
+            obs_crop=(0, 32, 0, 0),
+            obs_crop_mode="mask",
+            obs_crop_fill=0,
+            obs_grayscale=True,
+            obs_layout="chw",
+            obs_copy="safe_view",
+            obs_resize_algorithm="area",
+            frame_skip=train.REFERENCE_RECIPE.frame_skip,
+            frame_stack=train.FRAME_STACK,
+            maxpool_last_two=False,
+            noop_reset_max=0,
+            sticky_action_prob=0.0,
+            reward_clip=False,
+            info="data",
+            info_filter={"mode": "all", "keys": list(info_keys)},
+            doom_skill=train.REFERENCE_RECIPE.doom_skill,
+            game_variables=game_variables,
+            treat_episode_timeout_as_truncation=True,
+            vizdoom_config={
+                "episode_timeout": train.REFERENCE_RECIPE.episode_timeout,
+                "render_hud": REFERENCE_RENDER_HUD,
+            },
+        )
+    except ValueError as exc:
+        if REQUIRED_PLAYER_KILLS_SIGNAL in str(exc).casefold():
+            raise RuntimeError(
+                "env-ViZDoom-turbo must expose an exact player_killcount signal "
+                "that excludes monster infighting before this evaluation can certify transfer"
+            ) from exc
+        raise
     started = time.perf_counter()
     try:
         if tuple(env.action_table or ()) != train.RESTRICTED_ACTIONS:
             raise RuntimeError("reference action table differs from checkpoint contract")
         loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        if (
-            not isinstance(loaded, Mapping)
-            or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
-        ):
-            raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
+        try:
+            checkpoint_format_lane = _checkpoint_format_lane(loaded)
+        except ValueError as exc:
+            raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}") from exc
         policy = train.NatureActorCritic(**train._checkpoint_policy_kwargs(loaded)).to(device)
         policy.load_state_dict(loaded["policy_state_dict"])
         policy.eval()
@@ -362,7 +400,8 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
                         "lane_episode": lane_episode,
                         "provider_seed": provider_seed,
                         "game_seed": _game_seed(provider_seed),
-                        "kills": float(np.asarray(step_infos["killcount"])[lane]),
+                        "kills": float(np.asarray(step_infos[REQUIRED_PLAYER_KILLS_SIGNAL])[lane]),
+                        "vizdoom_killcount": float(np.asarray(step_infos["killcount"])[lane]),
                         "return": float(episode_returns[lane]),
                         "length": int(episode_lengths[lane]),
                         "terminated": bool(np.asarray(terminated)[lane]),
@@ -467,12 +506,15 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         return {
             "type": "evaluation",
             "status": "completed",
-            "protocol": "standalone-zero-shot-vizdoom-turbo-v2-fixed-seed-grid",
+            "protocol": "standalone-zero-shot-env-vizdoom-turbo-v3-player-kills",
             "action_sampling": "stochastic" if args.stochastic_actions else "argmax",
             "checkpoint": str(args.checkpoint),
+            "checkpoint_format": loaded.get("format"),
+            "checkpoint_format_lane": checkpoint_format_lane,
             "checkpoint_sha256": train._file_sha256(args.checkpoint),
             "checkpoint_step": int(loaded.get("step", 0)),
             "checkpoint_config": loaded.get("config"),
+            "checkpoint_training_lineage": loaded.get("training_lineage"),
             "episodes": records,
             "episode_quotas": list(quotas),
             "evaluation_seed": int(args.seed),
@@ -495,6 +537,8 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             },
             "device": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
+            "env_vizdoom_turbo": env_vizdoom_turbo.__version__,
+            "player_killcount_semantics": "source-player-enemy-kills-v1",
             **_summary(records),
         }
     finally:

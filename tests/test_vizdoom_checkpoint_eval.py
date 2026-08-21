@@ -29,27 +29,49 @@ def test_provider_and_game_seed_protocol_matches_known_first_lane() -> None:
 def test_zero_shot_summary_uses_reference_kill_target() -> None:
     result = tool._summary(
         (
-            {"kills": 31.0, "length": 100},
-            {"kills": 33.0, "length": 200},
+            {"kills": 27.0, "vizdoom_killcount": 31.0, "length": 100},
+            {"kills": 29.0, "vizdoom_killcount": 33.0, "length": 200},
         )
     )
 
-    assert result["evaluation/kills/mean"] == 32.0
+    assert result["evaluation/kills/mean"] == 28.0
+    assert result["evaluation/kills/signal"] == "player_killcount"
+    assert result["evaluation/vizdoom_killcount/mean"] == 32.0
     assert result["evaluation/episode/count"] == 2
-    assert result["evaluation/target/kills/mean"] == 31.78
-    assert result["evaluation/target/passed"] is True
+    assert result["evaluation/target/kills/mean"] == 30.0
+    assert result["evaluation/target/kills/signal"] == "player_killcount"
+    assert result["evaluation/target/passed"] is False
+    assert result["evaluation/compatibility_target/kills/mean"] == 31.78
+    assert result["evaluation/compatibility_target/kills/signal"] == "killcount"
+    assert result["evaluation/compatibility_target/passed"] is True
 
 
 def test_zero_shot_contract_keeps_the_training_hud_enabled() -> None:
     assert tool.REFERENCE_RENDER_HUD is True
 
 
-def test_reference_contract_excludes_env_doom_turbo_torch_only_player_kill_signal() -> None:
+def test_reference_contract_requires_exact_player_kill_signal() -> None:
     train = tool._load_standalone_train()
 
     game_variables = tool._reference_signal_names(train.GAME_VARIABLES)
     info_signals = tool._reference_signal_names(train.INFO_SIGNALS)
 
     assert "killcount" in game_variables
-    assert "player_killcount" not in game_variables
-    assert "player_killcount" not in info_signals
+    assert "player_killcount" in game_variables
+    assert "player_killcount" in info_signals
+
+
+def test_checkpoint_format_lane_keeps_historical_evidence_separate() -> None:
+    current = {
+        "format": tool.CURRENT_CHECKPOINT_FORMAT,
+        "policy_state_dict": {},
+        "config": {},
+    }
+    legacy = {
+        "format": "standalone-historical-project-ppo-v1",
+        "policy_state_dict": {},
+        "config": {},
+    }
+
+    assert tool._checkpoint_format_lane(current) == "current"
+    assert tool._checkpoint_format_lane(legacy) == "legacy-pre-rename"

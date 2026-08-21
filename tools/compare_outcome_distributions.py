@@ -251,7 +251,7 @@ def main() -> int:
         parser.error("--frame-skip must be positive")
 
     try:
-        from vizdoom_turbo import VizdoomTurboVecEnv
+        from env_vizdoom_turbo import EnvViZDoomTurboVecEnv
     except ImportError as exc:
         raise RuntimeError("comparison requires env-vizdoom-turbo") from exc
 
@@ -267,7 +267,7 @@ def main() -> int:
     results: list[dict[str, Any]] = []
 
     for program in args.programs:
-        env = VizdoomTurboVecEnv(
+        env = EnvViZDoomTurboVecEnv(
             str(args.config),
             use_restricted_actions=DEATHMATCH_ACTIONS,
             rom_path=str(args.iwad),

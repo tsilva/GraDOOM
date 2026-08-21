@@ -380,6 +380,7 @@ dependencies = [
     { name = "gymnasium" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pyyaml" },
     { name = "torch" },
     { name = "wandb" },
 ]
@@ -397,6 +398,7 @@ dev = [
 requires-dist = [
     { name = "gymnasium", specifier = ">=1.2,<2" },
     { name = "numpy", specifier = ">=1.26,<3" },
+    { name = "pyyaml", specifier = ">=6,<7" },
     { name = "torch", specifier = ">=2.13,<2.14" },
     { name = "wandb", specifier = ">=0.18,<0.23" },
 ]

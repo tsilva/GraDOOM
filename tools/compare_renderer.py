@@ -19,10 +19,10 @@ def _reference_policy_frame(reference_rgb: torch.Tensor) -> torch.Tensor:
     """Apply the pinned env-ViZDoom-turbo deathmatch observation transform."""
 
     try:
-        from vizdoom_turbo._vizdoom_turbo import preprocess_into
+        from env_vizdoom_turbo._env_vizdoom_turbo import preprocess_into
     except ImportError as exc:
         raise RuntimeError(
-            "compare_renderer.py requires the reference vizdoom_turbo package"
+            "compare_renderer.py requires the reference env_vizdoom_turbo package"
         ) from exc
     current = reference_rgb.to(torch.uint8).numpy()[None]
     output = np.empty((1, 84, 84, 1), dtype=np.uint8)

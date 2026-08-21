@@ -7,7 +7,8 @@
   quality target, and a predeclared three-kill transfer margin.
 - Scale the canonical 500M-transition recipes to a matched 2,048 x 16 rollout
   while preserving the GradLab PPO minibatch, epoch count, and optimizer-update
-  density; measured two-job execution saves 13.8% wall-clock on the RTX 4090.
+  density; mature workload measurements select sequential execution because
+  two concurrent jobs are 11.5% slower on the RTX 4090.
 - Consume the renamed `env_vizdoom_turbo` provider and its exact
   `PLAYER_KILLCOUNT` signal while retaining map-wide `KILLCOUNT` only as the
   historical compatibility metric.

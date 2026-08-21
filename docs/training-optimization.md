@@ -386,13 +386,14 @@ that optimizer-update density. It uses the transfer-tested native-fused
 renderer and writes a resumable checkpoint every 128 rollouts (approximately
 4.19 million transitions).
 
-Short steady-state measurements on the RTX 4090 record 23,025.75 transitions/s
-for Nature and 18,245.31 transitions/s for small ResNet when each runs alone.
-That projects to 6.03 and 7.61 hours respectively, or 13.64 hours sequentially.
-When both jobs run concurrently, the corresponding rates are 15,204.01 and
-11,816.94 transitions/s. Concurrent execution therefore projects to 11.75
-hours for both results, saving about 1.89 hours (13.8%) of wall-clock time.
-Peak CUDA allocation is 3.12 GiB per process, so the two-job launch fits the
-24 GiB device with substantial memory headroom. The long seed-123 comparison is
-therefore launched concurrently; final quality comparisons remain based on the
-predeclared exact player-kill evaluations, not these throughput samples.
+Reset-heavy eight-rollout probes initially suggested that concurrent execution
+would be faster, but they ended before representative episodes were active. A
+mature comparison on the live seed-123 policies instead records 20,514.89
+transitions/s for Nature and 15,810.58 transitions/s for small ResNet in
+45-second solo windows. During the preceding concurrent windows, their median
+rates were 10,181.27 and 8,004.92 transitions/s. That projects to 15.55 hours
+for two complete sequential runs versus 17.35 hours for concurrent completion,
+making concurrency about 1.80 hours (11.5%) slower despite fitting comfortably
+in device memory. The long comparison therefore runs Nature first and resumes
+the interruption-checkpointed ResNet afterward. Final quality comparisons
+remain based on the predeclared exact player-kill evaluations, not throughput.

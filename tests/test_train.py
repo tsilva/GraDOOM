@@ -69,12 +69,12 @@ def test_exactly_two_canonical_deathmatch_recipes_are_cold_start_and_matched() -
             "mode": "random",
         }
         assert audit["effective_recipe"]["timesteps"] == 500_000_000
-        assert audit["effective_recipe"]["num_envs"] == 2048
-        assert audit["effective_recipe"]["n_steps"] == 16
-        assert audit["effective_recipe"]["batch_size"] == 1024
+        assert audit["effective_recipe"]["num_envs"] == 128
+        assert audit["effective_recipe"]["n_steps"] == 32
+        assert audit["effective_recipe"]["batch_size"] == 256
         assert audit["effective_recipe"]["n_epochs"] == 2
-        assert audit["effective_recipe"]["learning_rate"] == 9.375e-5
-        assert audit["effective_recipe"]["checkpoint_every_rollouts"] == 128
+        assert audit["effective_recipe"]["learning_rate"] == 6.25e-5
+        assert audit["effective_recipe"]["checkpoint_every_rollouts"] == 244
         assert audit["effective_recipe"]["observation_renderer"] == "native-fused"
         assert audit["effective_recipe"]["reward_shape"] == "native-v1"
         assert audit["effective_recipe"]["privileged_imitation_coef"] == 0.0
@@ -88,6 +88,7 @@ def test_exactly_two_canonical_deathmatch_recipes_are_cold_start_and_matched() -
             6841,
         ]
         assert audit["source_recipe"]["certification"]["minimum_passing_seeds"] == 4
+        assert audit["source_recipe"]["reference"] == train.PUBLISHED_DEATHMATCH_REFERENCE
         assert audit["source_recipe"]["evaluation"] == {
             "providers": ["env-Doom-turbo-torch", "env-ViZDoom-turbo"],
             "episodes": 100,
@@ -124,6 +125,24 @@ def test_canonical_recipe_allows_only_predeclared_seed_and_audits_override() -> 
         train._validate_args(
             train._parse_args(("--config", str(recipe), "--seed", "999", "--config-only"))
         )
+
+
+def test_canonical_recipe_evaluation_does_not_require_training_checkpoint(
+    tmp_path: Path,
+) -> None:
+    recipe = Path(__file__).parents[1] / "recipes" / "deathmatch-nature.yaml"
+    evaluation_checkpoint = tmp_path / "policy.pt"
+    evaluation_checkpoint.touch()
+    args = train._parse_args(
+        (
+            "--config",
+            str(recipe),
+            "--evaluate-checkpoint",
+            str(evaluation_checkpoint),
+        )
+    )
+
+    train._validate_args(args)
 
 
 def test_canonical_recipe_rejects_imitation_imports_and_modified_wall_damage() -> None:

@@ -21,6 +21,8 @@ import torch
 
 PUBLISHED_CHECKPOINT_SHA256 = "e5596d939cef0b6d34e75874b4d917660e7b6efab672ad8d7bea85445a7bb100"
 PUBLISHED_CHECKPOINT_STEP = 463_970_304
+PUBLISHED_RECIPE_SHA256 = "a36572a1064a98f67fb1007dcb655888925e5fb4bd756cbb4ef2f6f3a52dc44c"
+PUBLISHED_SOURCE = "huggingface:tsilva/VizdoomDeathmatch-v1_gradlab-ppo_b0330247@v3"
 
 
 def _load_standalone_train() -> ModuleType:
@@ -122,6 +124,29 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _published_training_lineage(checkpoint_sha256: str) -> dict[str, Any]:
+    """Label conversion as imported evidence while retaining source cold-start provenance."""
+
+    return {
+        "schema": "env-doom-turbo-torch/training-lineage-v1",
+        "provenance_complete": True,
+        "root_initialization": {
+            "mode": "published-external-cold-start",
+            "source": PUBLISHED_SOURCE,
+            "checkpoint_sha256": checkpoint_sha256,
+            "checkpoint_step": PUBLISHED_CHECKPOINT_STEP,
+        },
+        "imported_policy_weights": True,
+        "evidence_lane": "published-external-cold-start",
+        "source_recipe": {
+            "uri": PUBLISHED_SOURCE,
+            "sha256": PUBLISHED_RECIPE_SHA256,
+        },
+        "training_seed": 123,
+        "policy_architecture": "nature",
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     source_path = args.source.expanduser().resolve()
@@ -145,7 +170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit: dict[str, Any] = train._audit_config(audit_args)
     audit["operation"] = "convert_gradlab_checkpoint"
     audit["initialization"] = {
-        "source": "huggingface:tsilva/VizdoomDeathmatch-v1_gradlab-ppo_b0330247",
+        "source": PUBLISHED_SOURCE,
         "source_checkpoint_sha256": actual_sha256,
         "source_checkpoint_step": PUBLISHED_CHECKPOINT_STEP,
         "context_adaptation": "current-21-to-newest-of-history-84-exact",
@@ -156,6 +181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         optimizer=optimizer,
         step=PUBLISHED_CHECKPOINT_STEP,
         audit=audit,
+        training_lineage=_published_training_lineage(actual_sha256),
     )
     print(destination)
     return 0

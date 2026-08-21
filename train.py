@@ -208,8 +208,24 @@ POLICY_ARCHITECTURES = {
 FUSION_ACTIVATIONS = ("tanh", "relu")
 DEATHMATCH_RECIPE_SCHEMA = "env-doom-turbo-torch/deathmatch-recipe-v1"
 DEATHMATCH_RECIPE_TOP_LEVEL_KEYS = frozenset(
-    {"schema", "name", "description", "certification", "training", "evaluation"}
+    {
+        "schema",
+        "name",
+        "description",
+        "reference",
+        "certification",
+        "training",
+        "evaluation",
+    }
 )
+PUBLISHED_DEATHMATCH_REFERENCE = {
+    "kind": "immutable-published-cold-start",
+    "uri": "hf://tsilva/VizdoomDeathmatch-v1_gradlab-ppo_b0330247@v3",
+    "recipe_sha256": "a36572a1064a98f67fb1007dcb655888925e5fb4bd756cbb4ef2f6f3a52dc44c",
+    "checkpoint_sha256": "e5596d939cef0b6d34e75874b4d917660e7b6efab672ad8d7bea85445a7bb100",
+    "checkpoint_step": 463_970_304,
+    "source_commit": "bfad768f66d68d3ddc01f69691ef1e5dbab9a931",
+}
 DEATHMATCH_RECIPE_RUNTIME_KEYS = frozenset(
     {
         "config",
@@ -666,6 +682,11 @@ def _load_deathmatch_recipe(path: Path) -> tuple[dict[str, Any], Path, str]:
     name = recipe.get("name")
     if not isinstance(name, str) or not name.strip():
         raise ValueError("deathmatch recipe name must be a non-empty string")
+    reference = dict(_mapping(recipe.get("reference"), label="recipe reference"))
+    if reference != PUBLISHED_DEATHMATCH_REFERENCE:
+        raise ValueError(
+            "deathmatch recipe reference must identify the immutable published cold-start recipe"
+        )
 
     certification = _mapping(recipe.get("certification"), label="recipe certification")
     training_seeds = certification.get("training_seeds")
@@ -796,6 +817,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "schema": str(recipe["schema"]),
             "path": str(source),
             "sha256": source_sha256,
+            "reference": dict(_mapping(recipe["reference"], label="reference")),
             "certification": dict(_mapping(recipe["certification"], label="certification")),
             "evaluation": dict(_mapping(recipe["evaluation"], label="evaluation")),
             "training": dict(_mapping(recipe["training"], label="training")),
@@ -895,7 +917,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         destination = _checkpoint_destination(args.checkpoint)
         if destination.exists():
             raise FileExistsError(f"refusing to overwrite checkpoint: {destination}")
-    elif args.checkpoint_every_rollouts and not args.config_only:
+    elif (
+        args.checkpoint_every_rollouts and not args.config_only and args.evaluate_checkpoint is None
+    ):
         raise ValueError("checkpoint-every-rollouts requires --checkpoint")
     if args.resume is not None:
         args.resume = _checkpoint_destination(args.resume)

@@ -357,17 +357,23 @@ deathmatch WAD, action table, and game-seed grid in both providers.
 | Policy evidence lane | env-Doom player kills | env-ViZDoom player kills | Reference minus device | Paired 95% interval | env-Doom / env-ViZDoom map kills |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Historical adapted Nature, 4.03M | 25.51 | 37.91 | +12.40 | [+7.47, +17.33] | 28.93 / 40.32 |
+| Published cold-start Nature, 463.97M | 17.39 | 33.25 | +15.86 | [+11.51, +20.21] | 19.24 / 35.27 |
 | Cold-start Nature, 17.34M | 14.01 | 14.04 | +0.03 | [-2.05, +2.11] | 15.60 / 15.88 |
 | Cold-start small ResNet, 31.92M | 17.16 | 15.66 | -1.50 | [-4.11, +1.11] | 18.57 / 17.54 |
 
 The historical checkpoint remains a warm-start evidence lane; it cannot certify
-the cold-start recipes. Re-evaluation with the native-fused renderer used for
-training corrects earlier local scratch results that were accidentally measured
-with the approximate renderer. Nature's entire paired interval is inside the
+the cold-start recipes. The immutable published checkpoint is genuine
+ViZDoom-trained cold-start evidence and proves that the source recipe and long
+horizon reach the target, but its reverse transfer to env-Doom-turbo-torch is
+not a certification lane and exposes a material high-skill observation or
+dynamics gap. Re-evaluation with the native-fused renderer used for training
+corrects earlier local scratch results that were accidentally measured with the
+approximate renderer. Nature's entire low-skill paired interval is inside the
 canonical plus-or-minus 3.0 player-kill transfer margin. ResNet's mean difference
 is inside that margin, but its interval is not yet narrow enough for statistical
-equivalence. The long runs retain the transfer-tested native-fused renderer and
-must still measure both providers.
+equivalence. The long runs retain the native-fused renderer and must measure the
+required env-Doom-to-env-ViZDoom transfer direction directly rather than infer
+it from the reverse-transfer result.
 
 Checkpoint SHA-256 values are `f4430d2ff5e08a651c6a52c22e426373c49dd5d55c93b6d6e0caf2906e0baddf`
 (historical Nature), `8257c58e51414b93b4e44e73ec0128e79ef7892092ed8053d132d99fc3ceb508`
@@ -376,24 +382,37 @@ Checkpoint SHA-256 values are `f4430d2ff5e08a651c6a52c22e426373c49dd5d55c93b6d6e
 
 ## Canonical cold-start recipe and launch shape
 
-The retained Nature and small-ResNet recipes each train for 500 million
-transitions from random initialization, with no imported policy weights or
-privileged imitation. They preserve the authoritative GradLab PPO learning
-rate, 1,024-sample minibatch, two epochs, and one optimizer minibatch per 512
-environment transitions. The GPU-native launch shape scales the rollout from
-128 x 32 to 2,048 x 16, or 32,768 transitions per rollout, without changing
-that optimizer-update density. It uses the transfer-tested native-fused
-renderer and writes a resumable checkpoint every 128 rollouts (approximately
-4.19 million transitions).
+The immutable `v3` publication of the 463,970,304-step GradLab policy is the
+authoritative proven recipe, not the later mutable checkout YAML. Its published
+`recipe.json` SHA-256 is
+`a36572a1064a98f67fb1007dcb655888925e5fb4bd756cbb4ef2f6f3a52dc44c`,
+and it materializes 128 environments x 32 steps, a 256-sample minibatch, two
+epochs, learning rate `6.25e-5`, entropy coefficient `0.01`, gamma `0.995`, GAE
+lambda `0.95`, global advantage normalization, and the SB3-parity execution
+profile. The source checkpoint SHA-256 is
+`e5596d939cef0b6d34e75874b4d917660e7b6efab672ad8d7bea85445a7bb100`
+at GradLab commit `bfad768f66d68d3ddc01f69691ef1e5dbab9a931`.
 
-Reset-heavy eight-rollout probes initially suggested that concurrent execution
-would be faster, but they ended before representative episodes were active. A
-mature comparison on the live seed-123 policies instead records 20,514.89
-transitions/s for Nature and 15,810.58 transitions/s for small ResNet in
-45-second solo windows. During the preceding concurrent windows, their median
-rates were 10,181.27 and 8,004.92 transitions/s. That projects to 15.55 hours
-for two complete sequential runs versus 17.35 hours for concurrent completion,
-making concurrency about 1.80 hours (11.5%) slower despite fitting comfortably
-in device memory. The long comparison therefore runs Nature first and resumes
-the interruption-checkpointed ResNet afterward. Final quality comparisons
-remain based on the predeclared exact player-kill evaluations, not throughput.
+An initial seed-123 launch incorrectly followed the later checkout recipe and
+then scaled its 4,096-transition rollout to 2,048 x 16. It stopped at 30,834,688
+transitions after reaching 6.31 rolling player kills and 33.95 native return.
+That run is retained as rejected evidence, but cannot reproduce the published
+lineage because its minibatch size, learning rate, temporal rollout, and
+execution profile differ. Reset-heavy probes also made its concurrency look
+faster; mature windows showed that two such large jobs were 11.5% slower than
+sequential execution.
+
+The retained Nature and small-ResNet YAMLs now copy the immutable published
+training contract exactly and differ only in their visual encoder. Both train
+for 500 million transitions from random initialization, with no imported policy
+weights or privileged imitation, on the native-fused renderer. They save
+resumable checkpoints every 244 rollouts, approximately one million transitions.
+
+Representative 128-rollout solo measurements give 2,698.46 steady-state
+transitions/s for Nature and 2,614.30 for small ResNet. A simultaneous
+64-rollout measurement gives 2,522.93 and 2,417.96 transitions/s, retaining
+93.5% and 92.5% of their respective solo rates. At those rates, two complete
+500M runs project to 104.60 hours sequentially versus 57.44 hours concurrently,
+a 47.16-hour or 45.1% wall-clock saving. The literal published-shape runs
+therefore launch concurrently. Final quality comparisons remain based on the
+predeclared exact player-kill evaluations, not throughput.

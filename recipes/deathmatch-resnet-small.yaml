@@ -1,12 +1,18 @@
 schema: env-doom-turbo-torch/deathmatch-recipe-v1
 name: deathmatch-resnet-small
 description: >-
-  Cold-start identity-initialized small ResNet candidate for the proven
-  500M-transition GradLab PPO horizon, using the same settings as the Nature
-  control except for the visual encoder and the same transfer-tested
-  GPU-resident native-fused observations. The larger rollout preserves
-  GradLab's minibatch, epochs, and update density while saturating the
-  Torch-native environment on the certified GPU.
+  Cold-start identity-initialized small ResNet candidate matched to the
+  immutable published 463.97M-step GradLab Nature recipe, extended to its
+  declared 500M-transition horizon and differing from the Nature control only
+  in the visual encoder.
+
+reference:
+  kind: immutable-published-cold-start
+  uri: hf://tsilva/VizdoomDeathmatch-v1_gradlab-ppo_b0330247@v3
+  recipe_sha256: a36572a1064a98f67fb1007dcb655888925e5fb4bd756cbb4ef2f6f3a52dc44c
+  checkpoint_sha256: e5596d939cef0b6d34e75874b4d917660e7b6efab672ad8d7bea85445a7bb100
+  checkpoint_step: 463970304
+  source_commit: bfad768f66d68d3ddc01f69691ef1e5dbab9a931
 
 certification:
   initialization: random
@@ -18,11 +24,11 @@ certification:
 training:
   timesteps: 500000000
   seed: 123
-  num_envs: 2048
-  n_steps: 16
-  batch_size: 1024
+  num_envs: 128
+  n_steps: 32
+  batch_size: 256
   n_epochs: 2
-  learning_rate: 0.00009375
+  learning_rate: 0.0000625
   ent_coef: 0.01
   death_penalty: 2.0
   wall_contact_damage_scale: 1.0
@@ -45,7 +51,7 @@ training:
   fused_optimizer: true
   torch_permutation: true
   steady_state_after_rollouts: 1
-  checkpoint_every_rollouts: 128
+  checkpoint_every_rollouts: 244
 
 evaluation:
   providers: [env-Doom-turbo-torch, env-ViZDoom-turbo]

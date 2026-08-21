@@ -46,3 +46,18 @@ def test_context_conversion_is_exact_for_current_context() -> None:
 
     assert torch.count_nonzero(context_weights[:, :-21]) == 0
     assert torch.equal(context_weights[:, -21:], source_context)
+
+
+def test_published_conversion_has_explicit_imported_evidence_lineage() -> None:
+    lineage = tool._published_training_lineage(tool.PUBLISHED_CHECKPOINT_SHA256)
+
+    assert lineage["provenance_complete"] is True
+    assert lineage["imported_policy_weights"] is True
+    assert lineage["evidence_lane"] == "published-external-cold-start"
+    assert lineage["root_initialization"] == {
+        "mode": "published-external-cold-start",
+        "source": tool.PUBLISHED_SOURCE,
+        "checkpoint_sha256": tool.PUBLISHED_CHECKPOINT_SHA256,
+        "checkpoint_step": tool.PUBLISHED_CHECKPOINT_STEP,
+    }
+    assert lineage["source_recipe"]["sha256"] == tool.PUBLISHED_RECIPE_SHA256
